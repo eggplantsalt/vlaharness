@@ -24,6 +24,10 @@ if TYPE_CHECKING:
 _HANDOFF_CONFIG_ATTR = "_rpent_handoff_runtime_config"
 _HANDOFF_CONFIG_PATH_ATTR = "_rpent_handoff_runtime_config_path"
 _RESEARCH_RESET_IDENTITY_ATTR = "_rpent_research_reset_identity"
+_RESEARCH_RUNTIME_ATTESTATION_ATTR = "_rpent_research_runtime_attestation"
+_RESEARCH_RUNTIME_ATTESTATION_SHA256_ATTR = (
+    "_rpent_research_runtime_attestation_sha256"
+)
 
 
 def _ensure_handoff_config(args: argparse.Namespace) -> HandoffRuntimeConfig | None:
@@ -59,6 +63,79 @@ def _validate_handoff_output(
     from robots.libero.handoff_runtime import resolve_handoff_output_dir
 
     resolve_handoff_output_dir(config, run_output_dir=output_dir)
+
+
+def _attest_research_runtime(
+    args: argparse.Namespace,
+    primitives_kwargs: dict[str, Any],
+) -> None:
+    """Probe and persist live Pi/SAM identity before reset or model action."""
+    trial_id = getattr(args, "research_trial_id", None)
+    if trial_id is None:
+        return
+    trial = getattr(args, "_rpent_research_trial_manifest", None)
+    if trial is None or trial.trial_id != trial_id:
+        raise RuntimeError("research runtime lacks its parser-validated trial")
+
+    from rpent.research.handoff.experiments.runtime_identity import (
+        attest_runtime_checkpoint_clients,
+        verify_runtime_attestation_binding,
+        write_runtime_attestation,
+    )
+
+    attestation = attest_runtime_checkpoint_clients(
+        primitives_kwargs,
+        trial.runtime,
+        trial_id=trial.trial_id,
+        manifest_id=str(args.research_manifest_id),
+        plan_id=str(args.research_plan_id),
+        source_revision=trial.source_revision,
+    )
+    destination = write_runtime_attestation(
+        attestation,
+        args.research_runtime_identity_output,
+    )
+    verified, digest = verify_runtime_attestation_binding(
+        destination,
+        trial_id=trial.trial_id,
+        manifest_id=str(args.research_manifest_id),
+        plan_id=str(args.research_plan_id),
+        source_revision=trial.source_revision,
+        expected_attestation_id=attestation.attestation_id,
+    )
+    setattr(args, _RESEARCH_RUNTIME_ATTESTATION_ATTR, verified)
+    setattr(args, _RESEARCH_RUNTIME_ATTESTATION_SHA256_ATTR, digest)
+
+
+def _research_reset_identity_request(
+    args: argparse.Namespace,
+) -> dict[str, Any] | None:
+    trial_id = getattr(args, "research_trial_id", None)
+    if trial_id is None:
+        return None
+    trial = getattr(args, "_rpent_research_trial_manifest", None)
+    attestation = getattr(args, _RESEARCH_RUNTIME_ATTESTATION_ATTR, None)
+    digest = getattr(args, _RESEARCH_RUNTIME_ATTESTATION_SHA256_ATTR, None)
+    if trial is None or attestation is None or not isinstance(digest, str):
+        raise RuntimeError(
+            "research reset cannot precede live Pi/SAM runtime attestation"
+        )
+    return {
+        "path": str(Path(args.research_reset_identity_output).resolve()),
+        "trial_id": str(trial_id),
+        "manifest_id": str(args.research_manifest_id),
+        "plan_id": str(args.research_plan_id),
+        "source_revision": trial.source_revision,
+        "suite": str(args.suite),
+        "task": int(args.task),
+        "seed": int(args.seed),
+        "max_episode_steps": int(args.max_episode_steps),
+        "runtime_attestation_path": str(
+            Path(args.research_runtime_identity_output).resolve()
+        ),
+        "runtime_attestation_id": attestation.attestation_id,
+        "runtime_attestation_sha256": digest,
+    }
 
 
 def get_env_spec() -> EnvSpec:
@@ -146,8 +223,9 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         "--handoff-config",
         default=None,
         help=(
-            "Path to a validated JSON config enabling the separate controller-"
-            "handoff research tools. Omit for exact Original Harness behavior."
+            "Path to a validated opt-in governor config that routes the original "
+            "Pi0 tool schemas through an instance-local research handler. Omit "
+            "for Original Harness tool routing."
         ),
     )
     parser.add_argument("--research-trial-id", default=None, help=argparse.SUPPRESS)
@@ -161,6 +239,14 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
         default=None,
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--research-runtime-identity-output",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--research-manifest-path", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--research-manifest-id", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--research-plan-id", default=None, help=argparse.SUPPRESS)
 
 
 def _parse_config(args: argparse.Namespace) -> RunConfig:
@@ -180,15 +266,25 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         args, "research_reset_identity_output", None
     )
     completion_output = getattr(args, "research_completion_output", None)
+    runtime_identity_output = getattr(
+        args, "research_runtime_identity_output", None
+    )
+    research_manifest_path = getattr(args, "research_manifest_path", None)
+    research_manifest_id = getattr(args, "research_manifest_id", None)
+    research_plan_id = getattr(args, "research_plan_id", None)
     if len(
         {
             research_trial_id is None,
             reset_identity_output is None,
             completion_output is None,
+            runtime_identity_output is None,
+            research_manifest_path is None,
+            research_manifest_id is None,
+            research_plan_id is None,
         }
     ) != 1:
         raise ValueError(
-            "research telemetry requires all three hidden research arguments"
+            "research telemetry requires the complete hidden manifest/plan argument set"
         )
 
     recipe_tag = f"{args.suite.replace('libero_', '')}_t{args.task}_s{args.seed}"
@@ -219,6 +315,162 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
                 "research completion output must be completion.json inside "
                 "this run output directory"
             )
+        resolved_runtime_identity = Path(runtime_identity_output).expanduser().resolve()
+        expected_runtime_identity = output_dir.resolve() / "runtime_identity.json"
+        if resolved_runtime_identity != expected_runtime_identity:
+            raise ValueError(
+                "research runtime identity output must be runtime_identity.json "
+                "inside this run output directory"
+            )
+        occupied = [
+            path
+            for path in (
+                resolved_output,
+                resolved_completion,
+                resolved_runtime_identity,
+                output_dir.resolve() / "states.json",
+            )
+            if path.exists()
+        ]
+        occupied.extend(output_dir.resolve().glob("transcript_*.json"))
+        if occupied:
+            raise FileExistsError(
+                "research child refuses stale authoritative artifacts: "
+                + ", ".join(str(path) for path in occupied)
+            )
+
+        from rpent.research.handoff.experiments.manifest import (
+            load_manifest,
+            verify_manifest_external_bindings,
+        )
+        from rpent.research.handoff.experiments.config import (
+            load_strict_json,
+            stable_digest,
+        )
+        from rpent.research.handoff.experiments.full_agent import (
+            FULL_AGENT_PYTHON_EXECUTABLE_ENV,
+            build_child_plan,
+        )
+
+        manifest = load_manifest(research_manifest_path)
+        if manifest.manifest_id != research_manifest_id:
+            raise ValueError("research manifest ID does not match manifest bytes")
+        verify_manifest_external_bindings(
+            manifest,
+            repo_root=get_repo_root(),
+            require_runtime_probes=True,
+        )
+        matches = [
+            trial
+            for trial in manifest.trials
+            if trial.trial_id == research_trial_id
+        ]
+        if len(matches) != 1:
+            raise ValueError("research manifest does not contain exactly one trial")
+        trial = matches[0]
+        bound_python = os.environ.get(FULL_AGENT_PYTHON_EXECUTABLE_ENV)
+        if not bound_python:
+            raise ValueError("research child lacks its bound Python executable")
+        try:
+            same_python = os.path.samefile(bound_python, sys.executable)
+        except OSError as exc:
+            raise ValueError("research child Python executable is unverifiable") from exc
+        if not same_python:
+            raise ValueError("research child Python executable disagrees with its plan")
+        expected_plan = build_child_plan(
+            trial,
+            manifest_path=research_manifest_path,
+            repo_root=get_repo_root(),
+            python_executable=bound_python,
+        )
+        if expected_plan.plan_id != research_plan_id:
+            raise ValueError("research plan ID does not bind this RPent child")
+        if expected_plan.manifest_id != manifest.manifest_id:
+            raise ValueError("research plan does not bind this manifest")
+        expected_values = {
+            "env_name": trial.runtime.env_name,
+            "suite": trial.task.suite,
+            "task": trial.task.task,
+            "seed": trial.task.seed,
+            "libero_type": trial.runtime.libero_type,
+            "max_episode_steps": trial.runtime.max_episode_steps,
+            "output_dir": str(Path(trial.output_dir)),
+            "planner": trial.planner.backend,
+            "model": trial.planner.model,
+            "base_url": trial.planner.base_url,
+            "max_turns": trial.planner.max_turns,
+            "max_tokens": trial.planner.max_tokens,
+            "planner_timeout_s": trial.planner.planner_timeout_s,
+            "claude_code_max_budget_usd": trial.planner.claude_code_max_budget_usd,
+            "no_images": trial.planner.no_images,
+            "env_endpoint": trial.runtime.env_endpoint,
+            "vla_endpoint": trial.runtime.vla_endpoint,
+            "sam3_endpoint": trial.runtime.sam3_endpoint,
+            "cuda_device": trial.runtime.cuda_device,
+        }
+        actual_values = {
+            key: (str(Path(value)) if key == "output_dir" else value)
+            for key, value in ((key, getattr(args, key)) for key in expected_values)
+        }
+        if actual_values != expected_values:
+            raise ValueError(
+                "actual RPent arguments disagree with manifest trial: "
+                f"expected={expected_values!r}, actual={actual_values!r}"
+            )
+        expected_handoff = (
+            output_dir.resolve() / "resolved_handoff_runtime.json"
+            if trial.condition.handoff_enabled
+            else None
+        )
+        actual_handoff = (
+            Path(args.handoff_config).expanduser().resolve()
+            if args.handoff_config is not None
+            else None
+        )
+        if actual_handoff != expected_handoff:
+            raise ValueError("actual handoff config path disagrees with manifest trial")
+        allowed_preexisting = {
+            output_dir.resolve() / "attempt.json",
+        }
+        if expected_handoff is not None:
+            allowed_preexisting.add(expected_handoff)
+        unexpected = sorted(
+            (
+                path.resolve()
+                for path in output_dir.resolve().rglob("*")
+                if path.is_file() and path.resolve() not in allowed_preexisting
+            ),
+            key=str,
+        )
+        if unexpected:
+            raise FileExistsError(
+                "research child found stale files before service startup: "
+                + ", ".join(str(path) for path in unexpected[:20])
+            )
+        for variable, expected in (
+            ("PI05_CHECKPOINT_PATH", trial.runtime.pi05_checkpoint_path),
+            ("SAM3_CHECKPOINT_PATH", trial.runtime.sam3_checkpoint_path),
+            ("RPENT_PI05_CHECKPOINT_ID", trial.runtime.pi05_checkpoint_id),
+            ("RPENT_SAM3_CHECKPOINT_ID", trial.runtime.sam3_checkpoint_id),
+        ):
+            if os.environ.get(variable) != expected:
+                raise ValueError(
+                    f"research child environment {variable} disagrees with manifest"
+                )
+        attempt = load_strict_json(output_dir.resolve() / "attempt.json")
+        if (
+            attempt.get("trial_id") != trial.trial_id
+            or attempt.get("manifest_id") != manifest.manifest_id
+            or attempt.get("plan_id") != research_plan_id
+            or attempt.get("source_revision") != trial.source_revision
+            or attempt.get("cwd") != str(get_repo_root().resolve())
+            or attempt.get("resolved_inner_command_sha256")
+            != stable_digest(expected_plan.resolved_inner_command)
+        ):
+            raise ValueError("research attempt marker disagrees with manifest/plan")
+        setattr(args, "_rpent_research_trial_manifest", trial)
+        setattr(args, "_rpent_research_manifest_id", manifest.manifest_id)
+        setattr(args, "_rpent_research_full_agent_plan", expected_plan)
 
     return RunConfig(
         recipe_tag=recipe_tag,
@@ -325,14 +577,13 @@ def init_task_runtime(
     runtime_values: dict[str, Any] = {"env": env}
     if handoff_config is not None and handoff_config.enabled:
         runtime_values[_HANDOFF_CONFIG_ATTR] = handoff_config
-    if getattr(args, "research_trial_id", None) is not None:
-        runtime_values[_RESEARCH_RESET_IDENTITY_ATTR] = {
-            "path": str(Path(args.research_reset_identity_output).resolve()),
-            "trial_id": str(args.research_trial_id),
-            "suite": str(args.suite),
-            "task": int(args.task),
-            "seed": int(args.seed),
-        }
+    try:
+        reset_identity_request = _research_reset_identity_request(args)
+    except Exception:
+        _stop_owned_daemons(owned_daemons)
+        raise
+    if reset_identity_request is not None:
+        runtime_values[_RESEARCH_RESET_IDENTITY_ATTR] = reset_identity_request
     return owned_daemons, runtime_values
 
 
@@ -456,10 +707,16 @@ def init_shared_runtime(
     model = VLAClient(vla_rpc)
     sam3_client = Sam3Client(sam3_rpc)
 
-    return owned_daemons, {
+    primitives_kwargs = {
         "model": model,
         "sam3_client": sam3_client,
     }
+    try:
+        _attest_research_runtime(args, primitives_kwargs)
+    except Exception:
+        _stop_owned_daemons(owned_daemons)
+        raise
+    return owned_daemons, primitives_kwargs
 
 
 def _init_runtime(
@@ -640,16 +897,20 @@ def _init_runtime(
         "model": VLAClient(vla_rpc),
         "sam3_client": Sam3Client(sam3_rpc),
     }
+    try:
+        _attest_research_runtime(args, primitives_kwargs)
+    except Exception:
+        _stop_owned_daemons(daemons)
+        raise
     if handoff_config is not None and handoff_config.enabled:
         primitives_kwargs[_HANDOFF_CONFIG_ATTR] = handoff_config
-    if getattr(args, "research_trial_id", None) is not None:
-        primitives_kwargs[_RESEARCH_RESET_IDENTITY_ATTR] = {
-            "path": str(Path(args.research_reset_identity_output).resolve()),
-            "trial_id": str(args.research_trial_id),
-            "suite": str(args.suite),
-            "task": int(args.task),
-            "seed": int(args.seed),
-        }
+    try:
+        reset_identity_request = _research_reset_identity_request(args)
+    except Exception:
+        _stop_owned_daemons(daemons)
+        raise
+    if reset_identity_request is not None:
+        primitives_kwargs[_RESEARCH_RESET_IDENTITY_ATTR] = reset_identity_request
     return daemons, primitives_kwargs
 
 

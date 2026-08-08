@@ -1,0 +1,11 @@
+{
+  "schema_version": "rpent.handoff-oracle-cost/v1",
+  "target_label": "primitive_success",
+  "failure_penalty": 100.0,
+  "analytic_distance_weight": 1.0,
+  "analytic_time_weight": 0.0,
+  "analytic_step_weight": 0.0,
+  "vla_time_weight": 0.01,
+  "vla_invocation_weight": 0.0,
+  "minimum_matched_candidates": 2
+}

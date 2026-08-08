@@ -8,6 +8,7 @@ non-authoritative ``metadata`` fields and must themselves be JSON serializable.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from enum import Enum
 from typing import Any, Literal, Self
@@ -112,6 +113,7 @@ class GovernorState(str, Enum):
     PERCEPTION_FAILURE = "perception_failure"
     STAGING_FAILURE = "staging_failure"
     VLA_FAILURE = "vla_failure"
+    OUTCOME_LABEL_FAILURE = "outcome_label_failure"
     DONE = "done"
 
 
@@ -127,6 +129,7 @@ class TerminationReason(str, Enum):
     PERCEPTION_FAILURE = "perception_failure"
     STAGING_FAILURE = "staging_failure"
     VLA_FAILURE = "vla_failure"
+    OUTCOME_LABEL_FAILURE = "outcome_label_failure"
     RPC_FAILURE = "rpc_failure"
     TIMEOUT = "timeout"
     INVALID_STATE = "invalid_state"
@@ -140,6 +143,7 @@ class FailureMode(str, Enum):
     PERCEPTION = "perception"
     STAGING = "staging"
     VLA = "vla"
+    OUTCOME_LABEL = "outcome_label"
     RPC = "rpc"
     TIMEOUT = "timeout"
     CANCELLATION = "cancellation"
@@ -189,6 +193,30 @@ class TrialIdentity(HandoffRecord):
     @classmethod
     def validate_ids(cls, value: str, info) -> str:
         return _non_empty(value, info.field_name)
+
+
+def outcome_record_id(identity: TrialIdentity) -> str:
+    """Return the one authoritative outcome key for an invocation.
+
+    Result-dependent fields such as termination reason, labels, and costs are
+    intentionally absent. A retry of the same invocation therefore targets
+    the same key, allowing append-only sinks to reject contradictory payloads
+    instead of accepting two incompatible outcomes.
+    """
+    canonical = json.dumps(
+        {
+            "schema_version": OUTCOME_SCHEMA_VERSION,
+            "run_id": identity.run_id,
+            "episode_id": identity.episode_id,
+            "trial_id": identity.trial_id,
+            "invocation_id": identity.invocation_id,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return "outcome-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
 
 
 class FeatureProvenance(HandoffRecord):
@@ -451,22 +479,31 @@ class OutcomeLabels(HandoffRecord):
 
 
 class CostRecord(HandoffRecord):
-    analytic_steps: int = Field(default=0, ge=0)
-    analytic_distance_m: float = Field(default=0.0, ge=0.0)
-    analytic_time_s: float = Field(default=0.0, ge=0.0)
+    analytic_steps: int | None = Field(default=0, ge=0)
+    analytic_distance_m: float | None = Field(default=0.0, ge=0.0)
+    analytic_time_s: float | None = Field(default=0.0, ge=0.0)
     # Null is reserved for artifact-only/post-run summaries where execution
     # began but the underlying runtime did not expose a trustworthy inference
     # count (for example, cancellation inside an Original Harness Pi0 call).
     vla_invocations: int | None = Field(default=0, ge=0)
     vla_chunks: int | None = Field(default=None, ge=0)
     vla_env_actions: int | None = Field(default=None, ge=0)
-    vla_time_s: float = Field(default=0.0, ge=0.0)
+    vla_time_s: float | None = Field(default=0.0, ge=0.0)
     total_env_actions: int | None = Field(default=None, ge=0)
-    total_elapsed_s: float = Field(default=0.0, ge=0.0)
+    total_elapsed_s: float | None = Field(default=0.0, ge=0.0)
     planner_time_s: float | None = Field(default=None, ge=0.0)
     llm_turns: int | None = Field(default=None, ge=0)
     input_tokens: int | None = Field(default=None, ge=0)
     output_tokens: int | None = Field(default=None, ge=0)
+    # Full-agent summaries keep system-wide analytic-tool time separate from
+    # local-governor staging time so the two scopes cannot be silently pooled.
+    system_analytic_time_s: float | None = Field(default=None, ge=0.0)
+    # Automated research runners explicitly record zero; null means the
+    # execution surface did not expose authoritative intervention telemetry.
+    intervention_count: int | None = Field(default=None, ge=0)
+    # Count/cost of explicitly detected recovery or retry operations.  The
+    # producing adapter must document its operational definition in metadata.
+    recovery_retry_cost: float | None = Field(default=None, ge=0.0)
 
 
 class TimingRecord(HandoffRecord):

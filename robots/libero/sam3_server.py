@@ -293,9 +293,14 @@ class Sam3Engine:
 class Sam3Facade(RpcFacade):
     """Expose :class:`Sam3Engine` through the shared RPC transports."""
 
-    def __init__(self, engine: Sam3Engine) -> None:
+    def __init__(
+        self,
+        engine: Sam3Engine,
+        checkpoint_id: str | None = None,
+    ) -> None:
         super().__init__()
         self._engine = engine
+        self._checkpoint_id = checkpoint_id
 
     def _dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
         if method == "segment":
@@ -337,6 +342,7 @@ class Sam3Facade(RpcFacade):
             path = Path(checkpoint)
             checkpoint_info = {
                 "path": str(path),
+                "configured_id": self._checkpoint_id,
                 "exists": path.exists(),
                 "is_file": path.is_file(),
             }
@@ -409,6 +415,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--parent-watch", action="store_true",
                         help="watch parent process via stdin pipe and exit when it dies")
+    parser.add_argument(
+        "--checkpoint-id",
+        default=None,
+        help="Immutable checkpoint content identity (or RPENT_SAM3_CHECKPOINT_ID).",
+    )
     return parser
 
 
@@ -432,7 +443,10 @@ def main() -> None:
             "before starting RPent"
         )
     engine = Sam3Engine.load(checkpoint)
-    facade = Sam3Facade(engine)
+    checkpoint_id = args.checkpoint_id or os.environ.get(
+        "RPENT_SAM3_CHECKPOINT_ID"
+    )
+    facade = Sam3Facade(engine, checkpoint_id=checkpoint_id)
     facade.serve(transport=args.transport, host=args.host, port=args.port,
                  parent_watch=args.parent_watch)
 

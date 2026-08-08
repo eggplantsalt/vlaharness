@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib.metadata
 import json
 import math
 import os
 import subprocess
 import sys
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -61,6 +63,33 @@ def _atomic_json(path: str | os.PathLike[str], value: Any) -> Path:
         encoding="utf-8",
     )
     os.replace(temporary, destination)
+    return destination
+
+
+def _immutable_json(path: str | os.PathLike[str], value: Any) -> Path:
+    """Write canonical JSON once, accepting only an identical prior value."""
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    canonical = (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            allow_nan=False,
+        )
+        + "\n"
+    )
+    if destination.exists():
+        if destination.read_text(encoding="utf-8") != canonical:
+            raise FileExistsError(
+                f"immutable JSON artifact already differs: {destination}"
+            )
+        return destination
+    with destination.open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(canonical)
+        stream.flush()
+        os.fsync(stream.fileno())
     return destination
 
 
@@ -230,6 +259,7 @@ def _probe_component(
 def _cmd_probe_runtime(args: argparse.Namespace) -> int:
     from rpent.research.handoff.experiments.probes import (
         ProbeStatus,
+        RuntimeProbeArtifact,
         RuntimeProbeOptions,
         run_runtime_probes,
     )
@@ -422,14 +452,68 @@ def _cmd_probe_runtime(args: argparse.Namespace) -> int:
         health_checks=health_checks,
         hidden_state_diagnostic=hidden_diagnostic,
     )
-    ok = not any(fact.status is ProbeStatus.ERROR for fact in probe.facts)
-    report = {
-        **probe.model_dump(mode="json", exclude_none=False),
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "ok": ok,
-        "captured_vla_observation_npz": captured_observation_path,
-        "pending_diagnostics": [fact.name for fact in probe.pending_diagnostics],
-    }
+    requested_observed = tuple(dict.fromkeys(args.require_observed or ()))
+    fact_by_name = {fact.name: fact for fact in probe.facts}
+    unknown_required = sorted(set(requested_observed).difference(fact_by_name))
+    if unknown_required:
+        raise ValueError(
+            "unknown --require-observed runtime facts: "
+            + ", ".join(unknown_required)
+        )
+    missing_required = [
+        name
+        for name in requested_observed
+        if fact_by_name[name].status is not ProbeStatus.OBSERVED
+    ]
+    checkpoint_identity_mismatches: list[dict[str, Any]] = []
+    if runtime is not None:
+        expected_checkpoint_ids = {
+            "vla": runtime.pi05_checkpoint_id,
+            "sam3": runtime.sam3_checkpoint_id,
+        }
+        for component, expected_id in expected_checkpoint_ids.items():
+            if endpoints[component] is None:
+                continue
+            if expected_id is None:
+                continue
+            fact = fact_by_name[f"{component}.model_checkpoint_identity"]
+            actual_id = None
+            if isinstance(fact.value, Mapping):
+                checkpoint_value = fact.value.get("checkpoint")
+                if isinstance(checkpoint_value, Mapping):
+                    actual_id = checkpoint_value.get("configured_id")
+            if actual_id != expected_id:
+                checkpoint_identity_mismatches.append(
+                    {
+                        "component": component,
+                        "expected": expected_id,
+                        "actual": actual_id,
+                    }
+                )
+    probe_calls_ok = not any(
+        fact.status is ProbeStatus.ERROR for fact in probe.facts
+    )
+    readiness_ok = (
+        probe_calls_ok
+        and not missing_required
+        and not checkpoint_identity_mismatches
+    )
+    ok = readiness_ok
+    artifact = RuntimeProbeArtifact(
+        report=probe,
+        timestamp_utc=datetime.now(timezone.utc).isoformat(),
+        ok=ok,
+        probe_calls_ok=probe_calls_ok,
+        readiness_ok=readiness_ok,
+        required_observed_facts=tuple(requested_observed),
+        required_facts_not_observed=tuple(missing_required),
+        checkpoint_identity_mismatches=tuple(checkpoint_identity_mismatches),
+        captured_vla_observation_npz=captured_observation_path,
+        pending_diagnostics=tuple(
+            fact.name for fact in probe.pending_diagnostics
+        ),
+    )
+    report = artifact.model_dump(mode="json", exclude_none=False)
     if args.output:
         _atomic_json(args.output, report)
     _emit(report)
@@ -439,10 +523,22 @@ def _cmd_probe_runtime(args: argparse.Namespace) -> int:
 def _gate0_plan(args: argparse.Namespace) -> dict[str, Any]:
     from rpent.research.handoff.experiments.runtime import (
         EXECUTION_CONFIRMATION,
+        gate0_plan_id,
+        gate0_resume_anchor,
+        gate0_runtime_environment,
         load_gate0_job,
     )
 
     job = load_gate0_job(args.job)
+    repo_root = str(Path(args.repo_root).resolve())
+    resume_anchor = gate0_resume_anchor(job.output_dir)
+    plan_id = gate0_plan_id(
+        job,
+        repo_root=repo_root,
+        limit=args.limit,
+        resume=args.resume,
+        resume_anchor=resume_anchor,
+    )
     command = [
         args.python_executable or sys.executable,
         "-m",
@@ -451,16 +547,21 @@ def _gate0_plan(args: argparse.Namespace) -> dict[str, Any]:
         "_gate0-child",
         "--job",
         str(Path(args.job).resolve()),
+        "--plan-id",
+        plan_id,
     ]
     if args.limit is not None:
         command.extend(("--limit", str(args.limit)))
     command.append("--resume" if args.resume else "--no-resume")
     return {
-        "schema_version": "rpent.handoff-gate0-child-plan/v1",
+        "schema_version": "rpent.handoff-gate0-child-plan/v2",
+        "plan_id": plan_id,
         "job_configuration_id": job.stable_configuration_id,
         "command": command,
-        "cwd": str(Path(args.repo_root).resolve()),
+        "cwd": repo_root,
         "output_dir": job.output_dir,
+        "resume_anchor": resume_anchor,
+        "env_overrides": gate0_runtime_environment(job),
         "execution_confirmation": EXECUTION_CONFIRMATION,
     }
 
@@ -468,16 +569,19 @@ def _gate0_plan(args: argparse.Namespace) -> dict[str, Any]:
 def _cmd_collect_gate0(args: argparse.Namespace) -> int:
     plan = _gate0_plan(args)
     plan_path = args.plan_output or str(
-        Path(plan["output_dir"]) / "gate0_child_plan.json"
+        Path(plan["output_dir"]) / "plans" / f"{plan['plan_id']}.json"
     )
-    _atomic_json(plan_path, plan)
+    _immutable_json(plan_path, plan)
     if not args.execute:
         _emit({**plan, "dry_run": True, "plan_path": str(Path(plan_path).resolve())})
         return 0
     _require_server_execution(args)
+    environment = os.environ.copy()
+    environment.update(plan["env_overrides"])
     completed = subprocess.run(
         plan["command"],
         cwd=plan["cwd"],
+        env=environment,
         shell=False,
         check=False,
         timeout=args.timeout_s,
@@ -502,28 +606,95 @@ class _CompositeSetupSink:
 
 
 def _cmd_gate0_child(args: argparse.Namespace) -> int:
-    from rpent.research.handoff.dataset import DatasetResearchSink, OutcomeDataset
+    from rpent.research.handoff.dataset import (
+        DatasetResearchSink,
+        OutcomeDataset,
+        dataset_fingerprint,
+        scan_decision_jsonl,
+    )
     from rpent.research.handoff.experiments.gate0 import (
         Gate0Adapter,
         Gate0Collector,
         Gate0Config,
         Gate0RunIdentity,
     )
+    from rpent.research.handoff.experiments.sampling import (
+        generate_gate0_samples,
+        sample_world_position,
+    )
     from rpent.research.handoff.experiments.runtime import (
         SetupJsonlSink,
+        gate0_plan_id,
+        gate0_resume_anchor,
+        gate0_runtime_environment,
         instantiate_gate0_adapter,
         load_gate0_job,
+        verify_gate0_job_external_bindings,
+    )
+    from rpent.research.handoff.experiments.runtime_identity import (
+        load_runtime_attestation,
     )
     from rpent.research.handoff.types import ControllerIdentity, SkillIdentity
 
     job = load_gate0_job(args.job)
+    verify_gate0_job_external_bindings(job, repo_root=Path.cwd())
+    resume_anchor = gate0_resume_anchor(job.output_dir)
+    expected_plan_id = gate0_plan_id(
+        job,
+        repo_root=Path.cwd(),
+        limit=args.limit,
+        resume=args.resume,
+        resume_anchor=resume_anchor,
+    )
+    if args.plan_id != expected_plan_id:
+        raise ValueError(
+            "Gate-0 child plan ID disagrees with the job/current output state: "
+            f"expected={expected_plan_id!r}, actual={args.plan_id!r}"
+        )
+    expected_environment = gate0_runtime_environment(job)
+    actual_environment = {
+        name: os.environ.get(name) for name in expected_environment
+    }
+    if actual_environment != expected_environment:
+        raise ValueError(
+            "Gate-0 child checkpoint environment disagrees with its plan: "
+            f"expected={expected_environment!r}, actual={actual_environment!r}"
+        )
+    if resume_anchor and not args.resume:
+        raise FileExistsError(
+            "Gate-0 authoritative artifacts already exist; choose --resume "
+            "and generate a new plan, or use a new output directory: "
+            + ", ".join(sorted(resume_anchor))
+        )
     output_dir = Path(job.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     gate0_config = Gate0Config.model_validate(job.gate0)
+    dataset_dir = output_dir / "online"
+    outcome_path = dataset_dir / "outcomes.jsonl"
+    decision_path = dataset_dir / "decisions.jsonl"
+    setup_path = output_dir / "privileged" / "setups.jsonl"
+    summary_path = output_dir / "collection_summary.json"
+    attempt_path = output_dir / "attempts" / f"{args.plan_id}.json"
+    attempt_summary_path = (
+        output_dir / "collection_attempts" / f"{args.plan_id}.json"
+    )
+    expected_samples = {
+        f"{job.episode_prefix}-trial-{sample.sample_id}": sample
+        for sample in generate_gate0_samples(gate0_config.sampler)
+    }
     run_manifest = {
-        "schema_version": "rpent.handoff-gate0-run-manifest/v1",
+        "schema_version": "rpent.handoff-gate0-run-manifest/v2",
         "configuration_id": job.stable_configuration_id,
-        "source_job_path": str(Path(args.job).resolve()),
+        "source_revision": job.source_revision,
+        "source_job_path": job.external_bindings.source_job_path,
+        "source_job_sha256": job.external_bindings.source_job_sha256,
+        "handoff_config_sha256": (
+            job.external_bindings.handoff_config_sha256
+        ),
+        "runtime_probe_sha256": {
+            binding.name: binding.sha256
+            for binding in job.external_bindings.runtime_probes
+        },
         "job": job.model_dump(mode="json", exclude_none=False),
     }
     run_manifest_path = output_dir / "gate0_run_manifest.json"
@@ -535,9 +706,514 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
                 "choose a new output_dir/run_id"
             )
     else:
-        _atomic_json(run_manifest_path, run_manifest)
+        _immutable_json(run_manifest_path, run_manifest)
+    attempt = {
+        "schema_version": "rpent.handoff-gate0-attempt/v1",
+        "plan_id": args.plan_id,
+        "configuration_id": job.stable_configuration_id,
+        "source_revision": job.source_revision,
+        "resume": args.resume,
+        "limit": args.limit,
+        "resume_anchor": dict(sorted(resume_anchor.items())),
+        "checkpoint_environment": expected_environment,
+    }
+    completed_trial_ids: set[str] = set()
+    existing_records = ()
+    if args.resume and outcome_path.exists():
+        # Validate the complete durable shard before constructing an adapter or
+        # a writer. A torn tail is evidence requiring inspection, not something
+        # a new physical process may silently truncate and continue past.
+        existing_records = OutcomeDataset.from_jsonl(
+            outcome_path,
+            allow_partial_final_line=False,
+        ).records
+        trial_keys = [record.identity.trial_id for record in existing_records]
+        invocation_keys = [
+            (record.identity.run_id, record.identity.invocation_id)
+            for record in existing_records
+        ]
+        if len(trial_keys) != len(set(trial_keys)):
+            raise ValueError(
+                "existing Gate-0 outcomes contain duplicate trial identities"
+            )
+        if len(invocation_keys) != len(set(invocation_keys)):
+            raise ValueError(
+                "existing Gate-0 outcomes contain duplicate invocation identities"
+            )
+        invalid = [
+            record.record_id
+            for record in existing_records
+            if (
+                record.identity.trial_id not in expected_samples
+                or record.identity.run_id != job.run_id
+                or record.identity.suite != job.suite
+                or str(record.identity.task_id) != str(job.task_id)
+                or record.identity.seed != job.seed
+                or record.identity.reset_id is None
+                or record.identity.candidate_id
+                != expected_samples[record.identity.trial_id].candidate_id
+                or record.identity.repeat_index
+                != expected_samples[record.identity.trial_id].repeat_index
+                or record.identity.episode_id
+                != (
+                    f"{job.episode_prefix}-episode-"
+                    f"{expected_samples[record.identity.trial_id].sample_id}"
+                )
+                or record.identity.invocation_id
+                != (
+                    f"{job.episode_prefix}-vla-"
+                    f"{expected_samples[record.identity.trial_id].sample_id}"
+                )
+                or record.skill.name != job.skill_name
+                or record.skill.semantic_target != job.target_description
+                or record.controller.method != job.controller_method
+                or record.controller.implementation_version
+                != job.controller_implementation_version
+                or record.controller.checkpoint_id != job.checkpoint_id
+                or record.controller.configuration_id
+                != job.stable_configuration_id
+                or record.source_revision != job.source_revision
+                or record.metadata.get("gate0_configuration_id")
+                != job.stable_configuration_id
+                or not isinstance(
+                    record.metadata.get("execution_plan_id"), str
+                )
+                or not isinstance(
+                    record.metadata.get("runtime_attestation_id"), str
+                )
+                or not isinstance(
+                    record.metadata.get("runtime_attestation_sha256"), str
+                )
+                or record.metadata.get("gate0_candidate_id")
+                != record.identity.candidate_id
+                or record.metadata.get("gate0_repeat_index")
+                != record.identity.repeat_index
+            )
+        ]
+        if invalid:
+            raise ValueError(
+                "existing Gate-0 outcomes disagree with the immutable run "
+                f"manifest: {invalid[:10]}"
+            )
+        completed_trial_ids = {
+            record.identity.trial_id for record in existing_records
+        }
+    decision_scan = None
+    if args.resume and decision_path.exists():
+        decision_scan = scan_decision_jsonl(
+            decision_path,
+            allow_partial_final_line=False,
+        )
+    attempts = {
+        path.stem: _strict_json_object(path)
+        for path in sorted((output_dir / "attempts").glob("*.json"))
+    }
+    attempt_summaries = {
+        path.stem: _strict_json_object(path)
+        for path in sorted((output_dir / "collection_attempts").glob("*.json"))
+    }
+    prior_attempt_ids = set(attempts).difference({args.plan_id})
+    if set(attempt_summaries) != prior_attempt_ids:
+        raise ValueError(
+            "Gate-0 resume found an unsealed attempt or orphan attempt summary; "
+            "inspect the run and choose a new output directory"
+        )
+    if not prior_attempt_ids:
+        orphan_shards = [
+            path
+            for path in (outcome_path, decision_path, setup_path)
+            if path.exists()
+        ]
+        telemetry_root = output_dir / "telemetry"
+        if telemetry_root.is_dir():
+            orphan_shards.extend(
+                path for path in telemetry_root.rglob("*") if path.is_file()
+            )
+        if orphan_shards:
+            raise ValueError(
+                "Gate-0 resume found shards with no sealed attempt provenance: "
+                + ", ".join(str(path) for path in orphan_shards[:10])
+            )
+    runtime_identity_paths = {
+        path.stem: path
+        for path in sorted((output_dir / "runtime_identity").glob("*.json"))
+    }
+    expected_runtime_attempts: set[str] = set()
+    outcome_owner: dict[str, str] = {}
+    for plan_id in sorted(prior_attempt_ids):
+        marker = attempts[plan_id]
+        summary = attempt_summaries[plan_id]
+        marker_anchor = marker.get("resume_anchor")
+        if (
+            marker.get("schema_version") != "rpent.handoff-gate0-attempt/v1"
+            or marker.get("plan_id") != plan_id
+            or marker.get("configuration_id") != job.stable_configuration_id
+            or marker.get("source_revision") != job.source_revision
+            or marker.get("checkpoint_environment") != expected_environment
+            or not isinstance(marker_anchor, dict)
+            or any(
+                not isinstance(key, str) or not isinstance(value, str)
+                for key, value in marker_anchor.items()
+            )
+            or not isinstance(marker.get("resume"), bool)
+            or (
+                marker.get("limit") is not None
+                and (
+                    isinstance(marker.get("limit"), bool)
+                    or not isinstance(marker.get("limit"), int)
+                    or marker.get("limit") < 0
+                )
+            )
+        ):
+            raise ValueError(f"Gate-0 attempt marker is invalid: {plan_id}")
+        if gate0_plan_id(
+            job,
+            repo_root=Path.cwd(),
+            limit=marker["limit"],
+            resume=marker["resume"],
+            resume_anchor=marker_anchor,
+        ) != plan_id:
+            raise ValueError(
+                f"Gate-0 attempt plan ID does not bind its marker: {plan_id}"
+            )
+        if (
+            summary.get("schema_version")
+            != "rpent.handoff-gate0-attempt-summary/v1"
+            or summary.get("plan_id") != plan_id
+            or summary.get("configuration_id") != job.stable_configuration_id
+            or summary.get("source_revision") != job.source_revision
+        ):
+            raise ValueError(f"Gate-0 attempt summary is invalid: {plan_id}")
+        record_ids = summary.get("record_ids")
+        if not isinstance(record_ids, list) or any(
+            not isinstance(record_id, str) or not record_id
+            for record_id in record_ids
+        ):
+            raise ValueError(f"Gate-0 attempt record IDs are invalid: {plan_id}")
+        if (
+            summary.get("collected") != len(record_ids)
+            or not isinstance(summary.get("resumed_completed"), int)
+            or not isinstance(summary.get("completed_after"), int)
+            or summary.get("completed_after")
+            != summary.get("resumed_completed") + len(record_ids)
+            or not isinstance(summary.get("dataset_fingerprint_before"), str)
+            or not isinstance(summary.get("dataset_fingerprint_after"), str)
+        ):
+            raise ValueError(
+                f"Gate-0 attempt counts/fingerprints are invalid: {plan_id}"
+            )
+        for record_id in record_ids:
+            if record_id in outcome_owner:
+                raise ValueError(
+                    "Gate-0 attempt summaries claim the same outcome twice: "
+                    f"{record_id}"
+                )
+            outcome_owner[record_id] = plan_id
+        attestation_id = summary.get("runtime_attestation_id")
+        attestation_sha256 = summary.get("runtime_attestation_sha256")
+        if record_ids and (
+            not isinstance(attestation_id, str)
+            or not isinstance(attestation_sha256, str)
+        ):
+            raise ValueError(
+                f"Gate-0 outcome-bearing attempt lacks runtime identity: {plan_id}"
+            )
+        if attestation_id is not None or attestation_sha256 is not None:
+            if not isinstance(attestation_id, str) or not isinstance(
+                attestation_sha256, str
+            ):
+                raise ValueError(
+                    f"Gate-0 attempt runtime identity is only partially bound: {plan_id}"
+                )
+            expected_runtime_attempts.add(plan_id)
+            attestation_path = runtime_identity_paths.get(plan_id)
+            if attestation_path is None:
+                raise ValueError(
+                    f"Gate-0 runtime attestation is missing: {plan_id}"
+                )
+            actual_sha256 = hashlib.sha256(
+                attestation_path.read_bytes()
+            ).hexdigest()
+            attestation = load_runtime_attestation(attestation_path)
+            if (
+                actual_sha256 != attestation_sha256
+                or attestation.attestation_id != attestation_id
+                or attestation.plan_id != plan_id
+                or attestation.source_revision != job.source_revision
+                or tuple(
+                    item.observed_checkpoint_id
+                    for item in attestation.observations
+                )
+                != (
+                    expected_environment["RPENT_PI05_CHECKPOINT_ID"],
+                    expected_environment["RPENT_SAM3_CHECKPOINT_ID"],
+                )
+            ):
+                raise ValueError(
+                    f"Gate-0 runtime attestation is invalid: {plan_id}"
+                )
+    if set(runtime_identity_paths) != expected_runtime_attempts:
+        raise ValueError(
+            "Gate-0 resume found an orphan runtime identity sidecar"
+        )
+    existing_by_id = {record.record_id: record for record in existing_records}
+    if set(outcome_owner) != set(existing_by_id):
+        raise ValueError(
+            "Gate-0 attempt summaries do not partition the durable outcomes"
+        )
+    cumulative_records: list[Any] = []
+    expected_before_count = 0
+    chronological_attempts = sorted(
+        prior_attempt_ids,
+        key=lambda plan_id: attempt_summaries[plan_id]["resumed_completed"],
+    )
+    if len(
+        {
+            attempt_summaries[plan_id]["resumed_completed"]
+            for plan_id in chronological_attempts
+        }
+    ) != len(chronological_attempts):
+        raise ValueError("Gate-0 sealed attempts have an ambiguous resume order")
+    for plan_id in chronological_attempts:
+        summary = attempt_summaries[plan_id]
+        if summary["resumed_completed"] != expected_before_count:
+            raise ValueError("Gate-0 sealed attempt counts do not form a chain")
+        if summary["dataset_fingerprint_before"] != dataset_fingerprint(
+            cumulative_records
+        ):
+            raise ValueError(
+                "Gate-0 sealed attempt input fingerprints do not form a chain"
+            )
+        try:
+            cumulative_records.extend(
+                existing_by_id[record_id]
+                for record_id in summary["record_ids"]
+            )
+        except KeyError as exc:
+            raise ValueError(
+                f"Gate-0 attempt references a missing outcome: {exc.args[0]}"
+            ) from exc
+        expected_before_count = len(cumulative_records)
+        if (
+            summary["completed_after"] != expected_before_count
+            or summary["dataset_fingerprint_after"]
+            != dataset_fingerprint(cumulative_records)
+        ):
+            raise ValueError(
+                "Gate-0 sealed attempt output fingerprints do not form a chain"
+            )
+    for record_id, plan_id in outcome_owner.items():
+        record = existing_by_id[record_id]
+        summary = attempt_summaries[plan_id]
+        if (
+            record.metadata.get("execution_plan_id") != plan_id
+            or record.metadata.get("runtime_attestation_id")
+            != summary.get("runtime_attestation_id")
+            or record.metadata.get("runtime_attestation_sha256")
+            != summary.get("runtime_attestation_sha256")
+        ):
+            raise ValueError(
+                f"Gate-0 outcome provenance disagrees with its attempt: {record_id}"
+            )
+    decision_count = (
+        len(decision_scan.envelopes) if decision_scan is not None else 0
+    )
+    handoff_outcome_count = sum(
+        1 for record in existing_records if record.handoff_occurred
+    )
+    if decision_count != handoff_outcome_count:
+        raise ValueError(
+            "Gate-0 decision and handoff-outcome shards are not a sealed pair"
+        )
+    if decision_scan is not None and any(
+        envelope.payload.action.value != "handoff_now"
+        for envelope in decision_scan.envelopes
+    ):
+        raise ValueError("Gate-0 direct collection contains a non-handoff decision")
+    durable_setup = SetupJsonlSink(setup_path)
+    if args.resume and durable_setup.records:
+        def setup_is_valid(record: Any) -> bool:
+            sample = expected_samples.get(record.identity.trial_id)
+            if sample is None or record.requested_candidate is None:
+                return False
+            expected_episode = (
+                f"{job.episode_prefix}-episode-{sample.sample_id}"
+            )
+            expected_invocation = (
+                f"{job.episode_prefix}-vla-{sample.sample_id}"
+            )
+            identity_ok = (
+                record.identity.run_id == job.run_id
+                and record.identity.episode_id == expected_episode
+                and record.identity.invocation_id == expected_invocation
+                and record.identity.suite == job.suite
+                and str(record.identity.task_id) == str(job.task_id)
+                and record.identity.seed == job.seed
+                and record.identity.reset_id is not None
+                and record.identity.repeat_index == sample.repeat_index
+                and record.identity.candidate_id == sample.candidate_id
+            )
+            candidate = record.requested_candidate
+            axis = gate0_config.sampler.approach_axis_world
+            expected_relative = sample_world_position(
+                sample,
+                target_position_m=(0.0, 0.0, 0.0),
+                approach_axis_world=axis,
+            )
+            target_values = [
+                value.values
+                for value in record.values
+                if value.name == "target_position_m"
+            ]
+            if len(target_values) != 1 or len(target_values[0]) != 3:
+                return False
+            expected_world = tuple(
+                float(target + relative)
+                for target, relative in zip(
+                    target_values[0], expected_relative, strict=True
+                )
+            )
+            close = lambda left, right: math.isclose(
+                float(left), float(right), rel_tol=0.0, abs_tol=1e-12
+            )
+            geometry_ok = (
+                candidate.candidate_id == sample.candidate_id
+                and candidate.kind == "perturbation"
+                and candidate.target_relative_position_m is not None
+                and all(
+                    close(left, right)
+                    for left, right in zip(
+                        candidate.target_relative_position_m,
+                        expected_relative,
+                        strict=True,
+                    )
+                )
+                and all(
+                    close(left, right)
+                    for left, right in zip(
+                        candidate.eef_position_m,
+                        expected_world,
+                        strict=True,
+                    )
+                )
+                and candidate.wrist_yaw_rad is not None
+                and candidate.wrist_pitch_rad is not None
+                and candidate.requested_standoff_m is not None
+                and close(candidate.wrist_yaw_rad, sample.wrist_yaw_rad)
+                and close(candidate.wrist_pitch_rad, sample.wrist_pitch_rad)
+                and close(candidate.requested_standoff_m, sample.standoff_m)
+            )
+            return identity_ok and geometry_ok
+
+        invalid_setups = [
+            record.record_id
+            for record in durable_setup.records
+            if not setup_is_valid(record)
+        ]
+        if invalid_setups:
+            raise ValueError(
+                "existing Gate-0 setup records disagree with the immutable "
+                f"job/sample geometry: {invalid_setups[:10]}"
+            )
+        referenced_setup_ids = [
+            record.setup_record_id
+            for record in existing_records
+            if record.setup_record_id is not None
+        ]
+        if len(referenced_setup_ids) != len(set(referenced_setup_ids)):
+            raise ValueError(
+                "existing Gate-0 outcomes reuse a privileged setup record"
+            )
+        durable_setup_ids = {record.record_id for record in durable_setup.records}
+        if durable_setup_ids != set(referenced_setup_ids):
+            raise ValueError(
+                "existing Gate-0 setups and outcome setup_record_id bindings "
+                "differ; an orphan/stale setup requires inspection and a new run"
+            )
+        outcome_by_setup = {
+            record.setup_record_id: record
+            for record in existing_records
+            if record.setup_record_id is not None
+        }
+        mismatched_setup_outcomes = [
+            setup.record_id
+            for setup in durable_setup.records
+            if setup.identity != outcome_by_setup[setup.record_id].identity
+        ]
+        if mismatched_setup_outcomes:
+            raise ValueError(
+                "existing Gate-0 setup/outcome identities disagree: "
+                f"{mismatched_setup_outcomes[:10]}"
+            )
+    # This equality is intentionally checked even when either side is empty.
+    # An outcome without its setup, or a setup whose outcome append never
+    # completed, is an interrupted physical trial and must not be resumed.
+    referenced_setup_ids = [
+        record.setup_record_id
+        for record in existing_records
+        if record.setup_record_id is not None
+    ]
+    if len(referenced_setup_ids) != len(set(referenced_setup_ids)):
+        raise ValueError("existing Gate-0 outcomes reuse a privileged setup record")
+    durable_setup_ids = {record.record_id for record in durable_setup.records}
+    if durable_setup_ids != set(referenced_setup_ids):
+        raise ValueError(
+            "existing Gate-0 setup/outcome shards are not a sealed pair; "
+            "an orphan or missing setup requires a new run"
+        )
+    pending_trial_ids = set(expected_samples).difference(completed_trial_ids)
+    if not pending_trial_ids:
+        if not summary_path.is_file():
+            raise ValueError(
+                "Gate-0 outcomes are complete but the immutable final summary "
+                "is missing; this is an unsealed prior attempt"
+            )
+        final_summary = _strict_json_object(summary_path)
+        if (
+            final_summary.get("schema_version")
+            != "rpent.handoff-gate0-collection-summary/v2"
+            or final_summary.get("configuration_id")
+            != job.stable_configuration_id
+            or final_summary.get("source_revision") != job.source_revision
+            or final_summary.get("completed") != len(expected_samples)
+            or final_summary.get("dataset_fingerprint")
+            != dataset_fingerprint(existing_records)
+            or final_summary.get("attempt_plan_ids")
+            != sorted(prior_attempt_ids)
+            or final_summary.get("record_ids")
+            != [record.record_id for record in existing_records]
+            or final_summary.get("run_manifest")
+            != str(run_manifest_path.resolve())
+        ):
+            raise ValueError("Gate-0 final summary disagrees with durable outcomes")
+        _emit({**final_summary, "summary_path": str(summary_path.resolve())})
+        return 0
+    if summary_path.exists():
+        raise ValueError(
+            "Gate-0 final summary exists while expected trials are missing"
+        )
+    if args.limit == 0:
+        _emit(
+            {
+                "schema_version": "rpent.handoff-gate0-noop/v1",
+                "plan_id": args.plan_id,
+                "configuration_id": job.stable_configuration_id,
+                "pending": len(pending_trial_ids),
+            }
+        )
+        return 0
+
+    _immutable_json(attempt_path, attempt)
+    execution_job = job.model_copy(
+        update={
+            "metadata": {
+                **job.metadata,
+                "execution_plan_id": args.plan_id,
+            }
+        }
+    )
     bundle = instantiate_gate0_adapter(
-        job,
+        execution_job,
         gate0_config=gate0_config,
         output_dir=output_dir,
     )
@@ -547,76 +1223,29 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
                 "configured Gate-0 adapter does not implement reset/current EEF/"
                 "governor adapter methods"
             )
-        dataset_dir = output_dir / "online"
+        if (
+            bundle.runtime_attestation is None
+            or not isinstance(bundle.runtime_attestation_sha256, str)
+            or bundle.runtime_attestation.plan_id != args.plan_id
+            or bundle.runtime_attestation.source_revision != job.source_revision
+            or tuple(
+                item.observed_checkpoint_id
+                for item in bundle.runtime_attestation.observations
+            )
+            != (
+                expected_environment["RPENT_PI05_CHECKPOINT_ID"],
+                expected_environment["RPENT_SAM3_CHECKPOINT_ID"],
+            )
+        ):
+            raise RuntimeError(
+                "Gate-0 adapter did not return the required live runtime attestation"
+            )
         outcome_sink = DatasetResearchSink(dataset_dir, fsync=True)
-        durable_setup = SetupJsonlSink(output_dir / "privileged" / "setups.jsonl")
         setup_sink = (
             _CompositeSetupSink((durable_setup, bundle.setup_sink))
             if bundle.setup_sink is not None
             else durable_setup
         )
-        completed_trial_ids: set[str] = set()
-        outcome_path = dataset_dir / "outcomes.jsonl"
-        if args.resume and outcome_path.exists():
-            existing_records = OutcomeDataset.from_jsonl(outcome_path).records
-            expected_samples = {
-                f"{job.episode_prefix}-trial-{sample.sample_id}"
-                for sample in Gate0Collector(
-                    adapter=bundle.adapter,
-                    config=gate0_config,
-                    skill=SkillIdentity(
-                        name=job.skill_name,
-                        semantic_target=job.target_description,
-                        learned_controller="pi0.5",
-                    ),
-                    controller=ControllerIdentity(
-                        method=job.controller_method,
-                        implementation_version=job.controller_implementation_version,
-                        checkpoint_id=job.checkpoint_id,
-                        configuration_id=job.stable_configuration_id,
-                    ),
-                    run_identity=Gate0RunIdentity(
-                        run_id=job.run_id,
-                        suite=job.suite,
-                        task_id=job.task_id,
-                        seed=job.seed,
-                        episode_prefix=job.episode_prefix,
-                        source_revision=job.source_revision,
-                    ),
-                    outcome_sink=outcome_sink,
-                    setup_sink=setup_sink,
-                    vla_kwargs={"prompt": job.skill_prompt, **job.vla_kwargs},
-                ).samples()
-            }
-            invalid = [
-                record.record_id
-                for record in existing_records
-                if (
-                    record.identity.trial_id not in expected_samples
-                    or record.identity.run_id != job.run_id
-                    or record.identity.suite != job.suite
-                    or str(record.identity.task_id) != str(job.task_id)
-                    or record.identity.seed != job.seed
-                    or record.identity.reset_id is None
-                    or record.skill.name != job.skill_name
-                    or record.skill.semantic_target != job.target_description
-                    or record.controller.method != job.controller_method
-                    or record.controller.implementation_version
-                    != job.controller_implementation_version
-                    or record.controller.checkpoint_id != job.checkpoint_id
-                    or record.controller.configuration_id
-                    != job.stable_configuration_id
-                    or record.source_revision != job.source_revision
-                )
-            ]
-            if invalid:
-                raise ValueError(
-                    "existing Gate-0 outcomes disagree with the immutable run "
-                    f"manifest: {invalid[:10]}"
-                )
-            completed_trial_ids = {
-                record.identity.trial_id for record in existing_records
-            }
         collector = Gate0Collector(
             adapter=bundle.adapter,
             config=gate0_config,
@@ -638,6 +1267,14 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
                 seed=job.seed,
                 episode_prefix=job.episode_prefix,
                 source_revision=job.source_revision,
+                configuration_id=job.stable_configuration_id,
+                execution_plan_id=args.plan_id,
+                runtime_attestation_id=(
+                    bundle.runtime_attestation.attestation_id
+                ),
+                runtime_attestation_sha256=(
+                    bundle.runtime_attestation_sha256
+                ),
             ),
             outcome_sink=outcome_sink,
             setup_sink=setup_sink,
@@ -648,19 +1285,70 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
     finally:
         if bundle.cleanup is not None:
             bundle.cleanup()
-    summary = {
-        "schema_version": "rpent.handoff-gate0-collection-summary/v1",
+
+    all_records = OutcomeDataset.from_jsonl(
+        outcome_path,
+        allow_partial_final_line=False,
+    ).records
+    all_decisions = scan_decision_jsonl(
+        decision_path,
+        allow_partial_final_line=False,
+    )
+    if len(all_decisions.envelopes) != sum(
+        1 for record in all_records if record.handoff_occurred
+    ):
+        raise RuntimeError(
+            "Gate-0 collection ended with unpaired decision/outcome shards"
+        )
+    final_setup_ids = {record.record_id for record in durable_setup.records}
+    final_referenced_setup_ids = {
+        record.setup_record_id
+        for record in all_records
+        if record.setup_record_id is not None
+    }
+    if final_setup_ids != final_referenced_setup_ids:
+        raise RuntimeError("Gate-0 collection ended with unpaired setup/outcome shards")
+    attempt_summary = {
+        "schema_version": "rpent.handoff-gate0-attempt-summary/v1",
+        "plan_id": args.plan_id,
         "configuration_id": job.stable_configuration_id,
+        "source_revision": job.source_revision,
         "collected": len(outcomes),
         "resumed_completed": len(completed_trial_ids),
+        "completed_after": len(all_records),
+        "dataset_fingerprint_before": dataset_fingerprint(existing_records),
+        "dataset_fingerprint_after": dataset_fingerprint(all_records),
+        "runtime_attestation_id": bundle.runtime_attestation.attestation_id,
+        "runtime_attestation_sha256": bundle.runtime_attestation_sha256,
         "outcome_jsonl": str(outcome_sink.outcome_path.resolve()),
         "decision_jsonl": str(outcome_sink.decision_path.resolve()),
         "setup_jsonl": str(durable_setup.path.resolve()),
         "run_manifest": str(run_manifest_path.resolve()),
         "record_ids": [record.record_id for record in outcomes],
     }
-    summary_path = _atomic_json(output_dir / "collection_summary.json", summary)
-    _emit({**summary, "summary_path": str(summary_path.resolve())})
+    _immutable_json(attempt_summary_path, attempt_summary)
+    final_summary_path: str | None = None
+    if len(all_records) == len(expected_samples):
+        final_summary = {
+            "schema_version": "rpent.handoff-gate0-collection-summary/v2",
+            "configuration_id": job.stable_configuration_id,
+            "source_revision": job.source_revision,
+            "completed": len(all_records),
+            "expected": len(expected_samples),
+            "dataset_fingerprint": dataset_fingerprint(all_records),
+            "run_manifest": str(run_manifest_path.resolve()),
+            "attempt_plan_ids": sorted((*prior_attempt_ids, args.plan_id)),
+            "record_ids": [record.record_id for record in all_records],
+        }
+        _immutable_json(summary_path, final_summary)
+        final_summary_path = str(summary_path.resolve())
+    _emit(
+        {
+            **attempt_summary,
+            "attempt_summary_path": str(attempt_summary_path.resolve()),
+            "final_summary_path": final_summary_path,
+        }
+    )
     return 0
 
 
@@ -693,6 +1381,7 @@ def _git_source_identity(
 
     revision = None
     dirty = None
+    source_revision = None
     if repo_root is not None:
         root = Path(repo_root).resolve()
         revision_result = subprocess.run(
@@ -715,15 +1404,35 @@ def _git_source_identity(
         )
         if status_result.returncode == 0:
             dirty = bool(status_result.stdout.strip())
+        from rpent.research.handoff.experiments.manifest import (
+            compute_source_revision,
+        )
+
+        source_revision = compute_source_revision(root)
     try:
         package_version = importlib.metadata.version("rpent")
     except importlib.metadata.PackageNotFoundError:
         package_version = None
+    runtime_path: str | None = None
+    runtime_sha256: str | None = None
+    if external_runtime_identity is not None:
+        candidate = Path(external_runtime_identity).expanduser().resolve()
+        if not candidate.is_file():
+            raise FileNotFoundError(
+                f"external runtime identity artifact not found: {candidate}"
+            )
+        from rpent.research.handoff.experiments.probes import RuntimeProbeArtifact
+
+        RuntimeProbeArtifact.model_validate(_strict_json_object(candidate))
+        runtime_path = str(candidate)
+        runtime_sha256 = hashlib.sha256(candidate.read_bytes()).hexdigest()
     return SourceIdentity(
         git_revision=revision,
         dirty=dirty,
         package_version=package_version,
-        external_runtime_identity=external_runtime_identity,
+        source_revision=source_revision,
+        external_runtime_identity=runtime_path,
+        external_runtime_identity_sha256=runtime_sha256,
     )
 
 
@@ -821,9 +1530,27 @@ def _cmd_positive_references(args: argparse.Namespace) -> int:
             f"positive-reference artifact exists: {destination}; pass --overwrite"
         )
     dataset = _load_outcome_dataset(args.outcomes)
+    from rpent.research.handoff.splits import SplitAssignment, SplitName
+
+    assignment = SplitAssignment.model_validate(
+        _strict_json_object(args.split_assignment)
+    )
+    expected_train_ids = tuple(
+        entry.record_id
+        for entry in assignment.entries
+        if entry.split is SplitName.TRAIN
+    )
+    actual_ids = tuple(sorted(record.record_id for record in dataset.records))
+    if actual_ids != expected_train_ids:
+        raise ValueError(
+            "positive-reference input must be exactly the train partition from "
+            "the supplied split assignment"
+        )
     artifact = build_positive_reference_artifact(
         dataset,
         target=args.target_label,
+        source_dataset_fingerprint=assignment.dataset_fingerprint,
+        split_assignment_fingerprint=assignment.fingerprint,
         maximum_references=args.maximum_references,
     )
     path = write_positive_reference_artifact(artifact, destination)
@@ -831,6 +1558,8 @@ def _cmd_positive_references(args: argparse.Namespace) -> int:
         {
             "artifact_id": artifact.artifact_id,
             "dataset_fingerprint": artifact.dataset_fingerprint,
+            "source_dataset_fingerprint": artifact.source_dataset_fingerprint,
+            "split_assignment_fingerprint": artifact.split_assignment_fingerprint,
             "target_label": artifact.target_label.value,
             "reference_count": len(artifact.references),
             "output": str(path.resolve()),
@@ -917,6 +1646,136 @@ def _cmd_materialize_splits(args: argparse.Namespace) -> int:
         },
     }
     _atomic_json(report_path, report)
+    _emit({**report, "report": str(report_path.resolve())})
+    return 0
+
+
+def _cmd_materialize_oracle(args: argparse.Namespace) -> int:
+    """Annotate Gate-0 landscapes and optional matched policy choices."""
+    from rpent.research.handoff.dataset import (
+        OutcomeJsonlWriter,
+        dataset_fingerprint,
+    )
+    from rpent.research.handoff.evaluation.oracle import (
+        OracleCostConfig,
+        annotate_matched_oracle_costs,
+    )
+
+    dataset = _load_outcome_dataset(args.outcomes)
+    policy_dataset = (
+        _load_outcome_dataset(args.policy_outcomes)
+        if args.policy_outcomes
+        else None
+    )
+    if (policy_dataset is None) != (args.policy_output is None):
+        raise ValueError(
+            "--policy-outcomes and --policy-output must be supplied together"
+        )
+    config = OracleCostConfig.model_validate(_strict_json_object(args.config))
+    result = annotate_matched_oracle_costs(
+        dataset.records,
+        config,
+        policy_records=(policy_dataset.records if policy_dataset else ()),
+    )
+    if policy_dataset is not None and result.annotated_policy_records == 0:
+        raise ValueError(
+            "--policy-outcomes was supplied, but no eligible policy record "
+            "matched a Gate-0 candidate landscape"
+        )
+    destination = Path(args.output)
+    policy_destination = Path(args.policy_output) if args.policy_output else None
+    report_path = Path(args.report_output) if args.report_output else (
+        destination.with_suffix(destination.suffix + ".report.json")
+    )
+    occupied = [
+        path
+        for path in (destination, policy_destination, report_path)
+        if path is not None and path.exists()
+    ]
+    if occupied:
+        raise FileExistsError(
+            "oracle outputs already exist: "
+            + ", ".join(str(path) for path in occupied)
+        )
+    staged_outputs: list[tuple[Path, Path]] = []
+
+    def stage_records(path: Path, records: Sequence[Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f"{path.name}.tmp")
+        if temporary.exists():
+            raise FileExistsError(f"stale oracle temporary exists: {temporary}")
+        try:
+            writer = OutcomeJsonlWriter(temporary, fsync=True)
+            for record in records:
+                writer.append(record)
+            staged_outputs.append((temporary, path))
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+    report = {
+        "schema_version": "rpent.handoff-oracle-materialization/v1",
+        "oracle_cost_configuration_id": result.configuration_id,
+        "oracle_cost_config": config.model_dump(mode="json", exclude_none=False),
+        "source_dataset_fingerprint": dataset.fingerprint,
+        "output_dataset_fingerprint": dataset_fingerprint(result.records),
+        "records": len(result.records),
+        "matched_groups": result.matched_groups,
+        "annotated_records": result.annotated_records,
+        "annotated_policy_records": result.annotated_policy_records,
+        "eligible_unmatched_records": result.eligible_unmatched_records,
+        "eligible_unmatched_policy_records": (
+            result.eligible_unmatched_policy_records
+        ),
+        "ineligible_records": result.ineligible_records,
+        "ineligible_policy_records": result.ineligible_policy_records,
+        "policy_source_dataset_fingerprint": (
+            policy_dataset.fingerprint if policy_dataset else None
+        ),
+        "policy_output_dataset_fingerprint": (
+            dataset_fingerprint(result.policy_records)
+            if result.policy_records
+            else None
+        ),
+        "policy_output": (
+            str(policy_destination.resolve())
+            if policy_destination is not None
+            else None
+        ),
+        "output": str(destination.resolve()),
+    }
+    report_temporary = report_path.with_name(f"{report_path.name}.tmp")
+    try:
+        stage_records(destination, result.records)
+        if policy_destination is not None:
+            stage_records(policy_destination, result.policy_records)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        if report_temporary.exists():
+            raise FileExistsError(
+                f"stale oracle report temporary exists: {report_temporary}"
+            )
+        staged_outputs.append((report_temporary, report_path))
+    except BaseException:
+        for temporary, _final in staged_outputs:
+            temporary.unlink(missing_ok=True)
+        raise
+    created_outputs: list[Path] = []
+    try:
+        report_temporary.write_text(
+            json.dumps(report, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        with report_temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        for temporary, final in staged_outputs:
+            os.replace(temporary, final)
+            created_outputs.append(final)
+    except BaseException:
+        for temporary, _final in staged_outputs:
+            temporary.unlink(missing_ok=True)
+        for final in created_outputs:
+            final.unlink(missing_ok=True)
+        raise
     _emit({**report, "report": str(report_path.resolve())})
     return 0
 
@@ -1081,6 +1940,27 @@ def _cmd_plot(args: argparse.Namespace) -> int:
         if args.rows_csv is None:
             raise ValueError(f"plot kind {args.kind!r} requires --rows-csv")
         rows = _read_csv_rows(args.rows_csv)
+        filters: dict[str, str] = {}
+        for expression in args.where or ():
+            key, separator, value = expression.partition("=")
+            if not separator or not key or not value:
+                raise ValueError("--where must use non-empty KEY=VALUE syntax")
+            if key in filters and filters[key] != value:
+                raise ValueError(f"contradictory --where filters for {key!r}")
+            filters[key] = value
+        if filters:
+            rows = [
+                row
+                for row in rows
+                if all(
+                    str(row.get(key)) == value
+                    for key, value in filters.items()
+                )
+            ]
+            if not rows:
+                raise ValueError(
+                    f"--where filters selected no plot rows: {filters}"
+                )
         if args.kind == "gate0":
             path = plot_gate0_landscape(
                 rows,
@@ -1336,9 +2216,15 @@ def _cmd_run_controlled(args: argparse.Namespace) -> int:
 def _cmd_controlled_child(args: argparse.Namespace) -> int:
     from rpent.research.handoff.experiments.runtime import run_controlled_trial
 
-    summary = run_controlled_trial(args.manifest, args.trial_id)
+    summary = run_controlled_trial(args.manifest, args.trial_id, args.plan_id)
     _emit(summary)
     return 130 if summary.get("cancelled") else 0
+
+
+def _cmd_full_agent_child(args: argparse.Namespace) -> int:
+    from rpent.research.handoff.experiments.full_agent import run_full_agent_trial
+
+    return run_full_agent_trial(args.manifest, args.trial_id, args.plan_id)
 
 
 def _cmd_run_full_agent(args: argparse.Namespace) -> int:
@@ -1347,10 +2233,6 @@ def _cmd_run_full_agent(args: argparse.Namespace) -> int:
         plan_full_agent_trials,
         write_child_plans,
     )
-    from rpent.research.handoff.experiments.runtime import (
-        write_resolved_handoff_config,
-    )
-
     _require_server_execution(args)
     _manifest, trials, journal, journal_path = _selected_trials(
         args,
@@ -1359,19 +2241,9 @@ def _cmd_run_full_agent(args: argparse.Namespace) -> int:
     if not trials:
         _emit({"dry_run": not args.execute, "trials": 0, "reason": "no selected pending trials"})
         return 0
-    # Materialize the exact controller configuration that each opt-in child
-    # will consume.  The Original Harness trials are deliberately left byte-for-
-    # byte on their existing command path and never receive --handoff-config.
-    planned_trials = []
-    for trial in trials:
-        if trial.condition.handoff_enabled:
-            resolved_path = write_resolved_handoff_config(trial)
-            trial = trial.model_copy(
-                update={"handoff_config_path": str(resolved_path.resolve())}
-            )
-        planned_trials.append(trial)
     plans = plan_full_agent_trials(
-        planned_trials,
+        trials,
+        manifest_path=args.manifest,
         repo_root=args.repo_root,
         python_executable=args.python_executable,
     )
@@ -1399,6 +2271,9 @@ def _cmd_run_full_agent(args: argparse.Namespace) -> int:
             for path in (
                 *Path(plan.output_dir).glob("transcript_*.json"),
                 Path(plan.output_dir) / "states.json",
+                Path(plan.output_dir) / "reset_identity.json",
+                Path(plan.output_dir) / "completion.json",
+                Path(plan.output_dir) / "handoff" / "outcomes.jsonl",
             )
             if path.exists()
         ]
@@ -1594,6 +2469,14 @@ def build_parser() -> argparse.ArgumentParser:
     probe.add_argument("--sam3-endpoint")
     probe.add_argument("--timeout-s", type=float, default=30.0)
     probe.add_argument("--output")
+    probe.add_argument(
+        "--require-observed",
+        action="append",
+        help=(
+            "Require this named fact to be observed for readiness (repeatable); "
+            "without it, exit status only reflects probe errors."
+        ),
+    )
     probe.add_argument("--vla-observation-npz")
     probe.add_argument(
         "--capture-vla-observation-npz",
@@ -1655,6 +2538,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     positive.add_argument("--outcomes", action="append", required=True)
     positive.add_argument("--target-label", required=True)
+    positive.add_argument("--split-assignment", required=True)
     positive.add_argument("--maximum-references", type=int)
     positive.add_argument("--output", required=True)
     positive.add_argument("--overwrite", action="store_true")
@@ -1668,6 +2552,21 @@ def build_parser() -> argparse.ArgumentParser:
     materialize.add_argument("--assignment", required=True)
     materialize.add_argument("--output-dir", required=True)
     materialize.set_defaults(handler=_cmd_materialize_splits)
+
+    oracle = subparsers.add_parser(
+        "materialize-oracle",
+        help=(
+            "Annotate Gate-0 landscapes and optional matched controlled-policy "
+            "choices with post-hoc oracle costs."
+        ),
+    )
+    oracle.add_argument("--outcomes", action="append", required=True)
+    oracle.add_argument("--policy-outcomes", action="append")
+    oracle.add_argument("--config", required=True)
+    oracle.add_argument("--output", required=True)
+    oracle.add_argument("--policy-output")
+    oracle.add_argument("--report-output")
+    oracle.set_defaults(handler=_cmd_materialize_oracle)
 
     evaluate = subparsers.add_parser(
         "evaluate",
@@ -1707,6 +2606,11 @@ def build_parser() -> argparse.ArgumentParser:
     plot.add_argument("--y-key", default="target_relative_y_m")
     plot.add_argument("--value-key", default="skill_success")
     plot.add_argument("--factor-key")
+    plot.add_argument(
+        "--where",
+        action="append",
+        help="Filter tidy CSV rows by exact KEY=VALUE before plotting (repeatable).",
+    )
     plot.set_defaults(handler=_cmd_plot)
 
     controlled = subparsers.add_parser(
@@ -1744,10 +2648,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     controlled_child.add_argument("--manifest", required=True)
     controlled_child.add_argument("--trial-id", required=True)
+    controlled_child.add_argument("--plan-id", required=True)
     controlled_child.set_defaults(handler=_cmd_controlled_child)
+
+    full_agent_child = subparsers.add_parser(
+        "_full-agent-child", help=argparse.SUPPRESS
+    )
+    full_agent_child.add_argument("--manifest", required=True)
+    full_agent_child.add_argument("--trial-id", required=True)
+    full_agent_child.add_argument("--plan-id", required=True)
+    full_agent_child.set_defaults(handler=_cmd_full_agent_child)
 
     gate0_child = subparsers.add_parser("_gate0-child", help=argparse.SUPPRESS)
     gate0_child.add_argument("--job", required=True)
+    gate0_child.add_argument("--plan-id", required=True)
     gate0_child.add_argument("--limit", type=int)
     gate0_child.add_argument(
         "--resume",

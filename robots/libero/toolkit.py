@@ -5,6 +5,7 @@ LIBERO primitives (``move_to``, ``pi0_pick``, ``release``, ...) on top.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -47,6 +48,11 @@ class LiberoToolkit(Toolkit):
             if reset_identity_request is not None
             else None
         )
+        self._research_direct_vla_attempt_count = 0
+        self._research_direct_vla_event_count = 0
+        self._research_direct_vla_previous_event_sha256: str | None = None
+        self._research_reset_id: str | None = None
+        self._research_reset_identity_sha256: str | None = None
         self._handoff = None
         self._handoff_config = (
             handoff_config
@@ -153,16 +159,74 @@ class LiberoToolkit(Toolkit):
         command = {"action": name, **kwargs}
         t0 = time.time()
         start_frame = self._primitives.recorded_frame_count()
+        direct_vla_attempt_index: int | None = None
+        terminal_phase = "completed"
+        terminal_error_type: str | None = None
+        terminal_error: str | None = None
+        if (
+            self._reset_identity_request is not None
+            and self._handoff is None
+            and name in {"pi0_pick", "pi0_doubled"}
+        ):
+            self._research_direct_vla_attempt_count += 1
+            direct_vla_attempt_index = self._research_direct_vla_attempt_count
+            self._append_direct_vla_attempt_event(
+                attempt_index=direct_vla_attempt_index,
+                tool_name=name,
+                phase="started",
+                elapsed_s=None,
+                error_type=None,
+                error=None,
+            )
         try:
             result = handler(**kwargs)
             self.raise_if_cancelled()
         except ToolCancelled as exc:
+            terminal_phase = "cancelled"
+            terminal_error_type = type(exc).__name__
+            terminal_error = str(exc)
             result = {
                 "error": str(exc),
                 "code": "tool_cancelled",
                 "interrupted": True,
             }
+        except Exception as exc:
+            if direct_vla_attempt_index is not None:
+                try:
+                    self._append_direct_vla_attempt_event(
+                        attempt_index=direct_vla_attempt_index,
+                        tool_name=name,
+                        phase="error",
+                        elapsed_s=max(0.0, time.time() - t0),
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
+                except Exception as evidence_error:
+                    if hasattr(exc, "add_note"):
+                        exc.add_note(
+                            "failed to append research direct-VLA error evidence: "
+                            f"{type(evidence_error).__name__}: {evidence_error}"
+                        )
+            raise
         elapsed = round(time.time() - t0, 2)
+
+        if direct_vla_attempt_index is not None:
+            if (
+                terminal_phase == "completed"
+                and isinstance(result, Mapping)
+                and result.get("error") is not None
+            ):
+                terminal_phase = "returned_error"
+                terminal_error_type = str(result.get("code") or "returned_error")
+                terminal_error = str(result.get("error"))
+            self._append_direct_vla_attempt_event(
+                attempt_index=direct_vla_attempt_index,
+                tool_name=name,
+                phase=terminal_phase,
+                elapsed_s=elapsed,
+                error_type=terminal_error_type,
+                error=terminal_error,
+            )
 
         if isinstance(result, dict):
             result_dict = result
@@ -192,6 +256,82 @@ class LiberoToolkit(Toolkit):
         if result_dict.get("interrupted"):
             out.update(result_dict)
         return out
+
+    def _append_direct_vla_attempt_event(
+        self,
+        *,
+        attempt_index: int,
+        tool_name: str,
+        phase: str,
+        elapsed_s: float | None,
+        error_type: str | None,
+        error: str | None,
+    ) -> None:
+        """Append fsynced evidence before/after each research Original VLA call."""
+        request = self._reset_identity_request
+        if request is None:
+            raise RuntimeError("direct-VLA attempt evidence requires research identity")
+        if (
+            self._research_reset_id is None
+            or self._research_reset_identity_sha256 is None
+        ):
+            raise RuntimeError("direct-VLA attempt cannot precede reset identity")
+        self._research_direct_vla_event_count += 1
+        payload = {
+            "schema_version": "rpent.research-direct-vla-attempt/v1",
+            "event_sequence": self._research_direct_vla_event_count,
+            "previous_event_sha256": (
+                self._research_direct_vla_previous_event_sha256
+            ),
+            "attempt_index": attempt_index,
+            "step_index": self._next_step + 1,
+            "trial_id": request["trial_id"],
+            "manifest_id": request["manifest_id"],
+            "plan_id": request["plan_id"],
+            "source_revision": request["source_revision"],
+            "reset_id": self._research_reset_id,
+            "reset_identity_sha256": self._research_reset_identity_sha256,
+            "runtime_attestation_id": request["runtime_attestation_id"],
+            "runtime_attestation_sha256": request[
+                "runtime_attestation_sha256"
+            ],
+            "tool_name": tool_name,
+            "phase": phase,
+            "vla_attempted": True,
+            "attempt_unit": "planner_visible_vla_tool_invocation",
+            "elapsed_s": elapsed_s,
+            "error_type": error_type,
+            "error": error,
+            "recorded_before_state_dump": True,
+        }
+        canonical_payload = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        event_sha256 = hashlib.sha256(canonical_payload).hexdigest()
+        record = {**payload, "event_sha256": event_sha256}
+        line = json.dumps(
+            record,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ) + "\n"
+        destination = get_output_dir() / "direct_vla_attempts.jsonl"
+        if self._research_direct_vla_event_count == 1:
+            mode = "x"
+        else:
+            if not destination.is_file():
+                raise RuntimeError("direct-VLA attempt journal disappeared during run")
+            mode = "a"
+        with destination.open(mode, encoding="utf-8", newline="\n") as stream:
+            stream.write(line)
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._research_direct_vla_previous_event_sha256 = event_sha256
 
     def init_primitives_clean(
         self,
@@ -241,26 +381,64 @@ class LiberoToolkit(Toolkit):
         request = self._reset_identity_request
         if request is None:
             return
-        required = {"path", "trial_id", "suite", "task", "seed"}
+        required = {
+            "path",
+            "trial_id",
+            "manifest_id",
+            "plan_id",
+            "source_revision",
+            "suite",
+            "task",
+            "seed",
+            "max_episode_steps",
+            "runtime_attestation_path",
+            "runtime_attestation_id",
+            "runtime_attestation_sha256",
+        }
         if set(request) != required:
             raise ValueError(
                 "research reset identity request must contain exactly "
                 f"{sorted(required)}"
             )
-        if not isinstance(request["trial_id"], str) or not request["trial_id"]:
-            raise ValueError("research reset trial_id must be non-empty")
-        if not isinstance(request["suite"], str) or not request["suite"]:
-            raise ValueError("research reset suite must be non-empty")
-        for field in ("task", "seed"):
+        for field in (
+            "trial_id",
+            "manifest_id",
+            "plan_id",
+            "source_revision",
+            "suite",
+            "runtime_attestation_id",
+            "runtime_attestation_sha256",
+        ):
+            if not isinstance(request[field], str) or not request[field]:
+                raise ValueError(f"research reset {field} must be non-empty")
+        for field in ("task", "seed", "max_episode_steps"):
             value = request[field]
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(
                     f"research reset {field} must be a non-negative integer"
                 )
 
+        from rpent.research.handoff.experiments.runtime_identity import (
+            verify_runtime_attestation_binding,
+        )
+
+        attestation, attestation_sha256 = verify_runtime_attestation_binding(
+            request["runtime_attestation_path"],
+            trial_id=request["trial_id"],
+            manifest_id=request["manifest_id"],
+            plan_id=request["plan_id"],
+            source_revision=request["source_revision"],
+            expected_attestation_id=request["runtime_attestation_id"],
+            expected_sha256=request["runtime_attestation_sha256"],
+        )
+
         payload = primitives.env.runtime_probe()
         if not isinstance(payload, Mapping):
             raise RuntimeError("live env runtime_probe did not return an object")
+        if payload.get("schema_version") != "rpent.runtime-probe/v1":
+            raise RuntimeError("live env runtime_probe schema mismatch")
+        if payload.get("component") != "libero_env":
+            raise RuntimeError("live env runtime_probe component mismatch")
         server_meta = payload.get("server_meta")
         runtime_meta = payload.get("runtime_meta")
         if not isinstance(server_meta, Mapping) or not isinstance(
@@ -269,7 +447,7 @@ class LiberoToolkit(Toolkit):
             raise RuntimeError(
                 "live env runtime_probe lacks server_meta/runtime_meta objects"
             )
-        for field in ("suite", "task", "seed"):
+        for field in ("suite", "task", "seed", "max_episode_steps"):
             if server_meta.get(field) != request[field]:
                 raise RuntimeError(
                     "live env identity disagrees with research trial: "
@@ -295,38 +473,37 @@ class LiberoToolkit(Toolkit):
         sidecar = {
             "schema_version": "rpent.research-reset-identity/v1",
             "trial_id": request["trial_id"],
+            "manifest_id": request["manifest_id"],
+            "plan_id": request["plan_id"],
+            "source_revision": request["source_revision"],
             "suite": request["suite"],
             "task": request["task"],
             "seed": request["seed"],
+            "max_episode_steps": request["max_episode_steps"],
             "reset_id": str(reset_id),
             "observed_after_reset": True,
             "source": "live_env_runtime_probe",
             "probe_schema_version": payload.get("schema_version"),
             "probe_component": payload.get("component"),
+            "runtime_attestation_id": attestation.attestation_id,
+            "runtime_attestation_sha256": attestation_sha256,
         }
-        temporary = destination.with_name(f".{destination.name}.tmp")
-        if temporary.exists():
-            raise FileExistsError(
-                f"research reset identity temporary already exists: {temporary}"
+        with destination.open("x", encoding="utf-8", newline="\n") as stream:
+            json.dump(
+                sidecar,
+                stream,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
             )
-        try:
-            with temporary.open("x", encoding="utf-8") as stream:
-                json.dump(
-                    sidecar,
-                    stream,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    indent=2,
-                    allow_nan=False,
-                )
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, destination)
-        except Exception:
-            if temporary.exists():
-                temporary.unlink()
-            raise
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        self._research_reset_id = str(reset_id)
+        self._research_reset_identity_sha256 = hashlib.sha256(
+            destination.read_bytes()
+        ).hexdigest()
 
     def close(self) -> None:
         """Flush the agent-side video buffer to disk (end-of-run).

@@ -35,6 +35,7 @@ from rpent.research.handoff.types import (
     TerminationRecord,
     TimingRecord,
     TrialIdentity,
+    outcome_record_id,
     unavailable_signal,
 )
 
@@ -287,18 +288,23 @@ def load_probe_reset_map(
     from rpent.research.handoff.experiments.probes import (
         ProbeSafety,
         ProbeStatus,
-        RuntimeProbeReport,
+        RuntimeProbeArtifact,
     )
 
     result: dict[tuple[str, int, int], str] = {}
     for raw_path in paths:
         path = Path(raw_path)
         try:
-            report = RuntimeProbeReport.model_validate(_strict_json(path))
+            artifact = RuntimeProbeArtifact.model_validate(_strict_json(path))
         except Exception as exc:
             raise FullAgentSummaryError(
                 f"runtime probe fails its complete schema: {path}: {exc}"
             ) from exc
+        if not artifact.readiness_ok or not artifact.probe_calls_ok:
+            raise FullAgentSummaryError(
+                f"runtime probe is not ready/complete reset evidence: {path}"
+            )
+        report = artifact.report
         fact = report.fact("env.reset_identity")
         if (
             fact.component != "env"
@@ -354,6 +360,38 @@ def load_probe_reset_map(
     return result
 
 
+def _system_analytic_time_s(
+    states: Sequence[Mapping[str, Any]],
+    records: Sequence[OutcomeRecord],
+) -> float:
+    """Return observed analytic-controller wall time across both hierarchies.
+
+    Planner-mediated physical primitives are represented directly in
+    ``states.json``.  Composite handoff entries include both local staging and
+    VLA execution, so their outer elapsed values are deliberately excluded and
+    replaced by the detailed governor staging telemetry.
+    """
+    outer_analytic_time = 0.0
+    for index, entry in enumerate(states[1:], start=1):
+        action = _physical_action(entry)
+        if action in _DIRECT_VLA_ACTIONS or action in _COMPOSITE_VLA_ACTIONS:
+            continue
+        elapsed = _finite_nonnegative(
+            entry.get("elapsed_s"), f"states[{index}].elapsed_s"
+        )
+        if elapsed is None:
+            raise FullAgentSummaryError(
+                f"analytic physical state {index} has no elapsed_s telemetry"
+            )
+        outer_analytic_time += elapsed
+    detailed = [record.costs.analytic_time_s for record in records]
+    if any(value is None for value in detailed):
+        raise FullAgentSummaryError(
+            "detailed governor outcome lacks analytic-time telemetry"
+        )
+    return outer_analytic_time + sum(float(value) for value in detailed)
+
+
 def _load_run_reset_identity(trial: TrialManifest) -> tuple[str, Path, str]:
     """Load reset evidence captured by this exact child immediately after reset."""
     path = Path(trial.output_dir) / "reset_identity.json"
@@ -403,6 +441,9 @@ def _load_completion_identity(
         or payload.get("trial_id") != trial.trial_id
         or payload.get("transcript_path") != str(transcript_path.resolve())
         or payload.get("transcript_sha256") != expected_digest
+        or payload.get("planner_backend") != trial.planner.backend
+        or payload.get("planner_model") != trial.planner.model
+        or payload.get("planner_base_url") != trial.planner.base_url
     ):
         raise FullAgentSummaryError(
             f"completion sidecar does not bind this trial/transcript: {path}"
@@ -625,6 +666,10 @@ def summarize_full_agent_trial(
     previous_terminated = False
     previous_truncated = False
     for state_index, entry in enumerate(states):
+        if state_index > 0 and not isinstance(entry.get("command"), Mapping):
+            raise FullAgentSummaryError(
+                f"states[{state_index}] lacks a physical command object"
+            )
         entry_terminated = entry.get("libero_terminated")
         entry_truncated = entry.get("episode_truncated")
         if not isinstance(entry_terminated, bool) or not isinstance(
@@ -712,6 +757,10 @@ def summarize_full_agent_trial(
     elapsed = _finite_nonnegative(transcript.get("elapsed_s"), "transcript.elapsed_s")
     if elapsed is None:
         raise FullAgentSummaryError("transcript.elapsed_s is required")
+    if completion.get("elapsed_s") != transcript.get("elapsed_s"):
+        raise FullAgentSummaryError(
+            "completion elapsed_s disagrees with transcript.elapsed_s"
+        )
     planner_time = _finite_nonnegative(stats.get("elapsed_s"), "stats.elapsed_s")
     planner_time_source = (
         "transcript.stats.elapsed_s" if planner_time is not None else None
@@ -731,6 +780,10 @@ def summarize_full_agent_trial(
             "transcript finish must be an object or null"
         )
     finish_status = finish.get("status") if isinstance(finish, Mapping) else None
+    if isinstance(finish, Mapping) and finish_status is None:
+        raise FullAgentSummaryError(
+            "non-null transcript finish must contain a status"
+        )
     if finish_status is not None and (
         not isinstance(finish_status, str)
         or finish_status not in {"success", "failure", "stuck"}
@@ -835,6 +888,14 @@ def summarize_full_agent_trial(
             return None
         return sum(int(value) for value in values)
 
+    def required_detailed_sum(field: str) -> float:
+        values = [getattr(record.costs, field) for record in records]
+        if any(value is None for value in values):
+            raise FullAgentSummaryError(
+                f"detailed governor outcome lacks required {field} telemetry"
+            )
+        return sum(float(value) for value in values)
+
     detailed_chunks = optional_detailed_sum("vla_chunks")
     combined_chunks = (
         detailed_chunks + direct_chunks
@@ -888,28 +949,27 @@ def summarize_full_agent_trial(
     )
 
     controller = _resolved_controller(trial, records, runtime_config)
-    record_payload = {
-        "version": EPISODE_SUMMARY_VERSION,
-        "trial_id": trial.trial_id,
-        "controller": controller.model_dump(mode="json", exclude_none=False),
-        "transcript_sha256": hashlib.sha256(transcript_path.read_bytes()).hexdigest(),
-        "states_sha256": hashlib.sha256(states_path.read_bytes()).hexdigest(),
-        "reset_identity_sha256": reset_sidecar_sha256,
-        "completion_sha256": completion_sha256,
-    }
+    identity = TrialIdentity(
+        run_id=trial.experiment_id,
+        episode_id=trial.trial_id,
+        trial_id=trial.trial_id,
+        invocation_id=f"{trial.trial_id}/episode-summary",
+        suite=trial.task.suite,
+        task_id=trial.task.task,
+        seed=trial.task.seed,
+        reset_id=reset_id,
+        repeat_index=trial.repeat_index,
+    )
+    system_analytic_time = _system_analytic_time_s(states, records)
+    learned_controller_tool_attempts = direct_tool_calls + len(composite_indices)
+    # This benchmark configures one semantic learned skill per episode.  The
+    # observable retry cost is therefore the number of additional learned-
+    # controller tool attempts beyond the first; it does not infer planner
+    # intent or count failed analytic staging as a successful VLA invocation.
+    recovery_retry_cost = float(max(0, learned_controller_tool_attempts - 1))
     return OutcomeRecord(
-        record_id=stable_identifier("full-agent-episode", record_payload),
-        identity=TrialIdentity(
-            run_id=trial.experiment_id,
-            episode_id=trial.trial_id,
-            trial_id=trial.trial_id,
-            invocation_id=f"{trial.trial_id}/episode-summary",
-            suite=trial.task.suite,
-            task_id=trial.task.task,
-            seed=trial.task.seed,
-            reset_id=reset_id,
-            repeat_index=trial.repeat_index,
-        ),
+        record_id=outcome_record_id(identity),
+        identity=identity,
         skill=SkillIdentity(
             name=trial.task.skill_name,
             semantic_target=trial.task.target_description,
@@ -941,11 +1001,9 @@ def summarize_full_agent_trial(
             llm_finish=llm_finish,
         ),
         costs=CostRecord(
-            analytic_steps=sum(record.costs.analytic_steps for record in records),
-            analytic_distance_m=sum(
-                record.costs.analytic_distance_m for record in records
-            ),
-            analytic_time_s=sum(record.costs.analytic_time_s for record in records),
+            analytic_steps=int(required_detailed_sum("analytic_steps")),
+            analytic_distance_m=required_detailed_sum("analytic_distance_m"),
+            analytic_time_s=required_detailed_sum("analytic_time_s"),
             vla_invocations=combined_inference_invocations,
             vla_chunks=combined_chunks,
             # Direct Pi0 states expose chunk counts but not a source-verified
@@ -954,7 +1012,7 @@ def summarize_full_agent_trial(
                 detailed_vla_actions if direct_tool_calls == 0 else None
             ),
             vla_time_s=(
-                sum(record.costs.vla_time_s for record in records)
+                required_detailed_sum("vla_time_s")
                 + direct_vla_time
             ),
             # The outer states trace does not expose source-verified executed
@@ -965,6 +1023,9 @@ def summarize_full_agent_trial(
             llm_turns=llm_turns,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            system_analytic_time_s=system_analytic_time,
+            intervention_count=0,
+            recovery_retry_cost=recovery_retry_cost,
         ),
         timing=TimingRecord(
             started_monotonic_s=0.0,
@@ -995,6 +1056,7 @@ def summarize_full_agent_trial(
             "condition": trial.condition.name,
             "representation": trial.condition.feature_set.value,
             "evidence_mode": trial.condition.evidence.value,
+            "decision_mode": trial.condition.decision.value,
             "uncertainty_mode": trial.condition.uncertainty.value,
             "hierarchy_mode": trial.condition.hierarchy.value,
             "detailed_outcome_record_ids": [record.record_id for record in records],
@@ -1025,6 +1087,17 @@ def summarize_full_agent_trial(
                 "full states trace lacks executed-step counts for every tool"
             ),
             "planner_time_source": planner_time_source,
+            "system_analytic_time_definition": (
+                "sum of planner-mediated non-VLA physical-tool elapsed_s plus "
+                "local-governor staging time; composite outer elapsed excluded"
+            ),
+            "intervention_count_definition": (
+                "automated research episode; no human intervention interface"
+            ),
+            "recovery_retry_cost_definition": (
+                "additional direct/composite learned-controller tool attempts "
+                "beyond the first in the configured single-skill episode"
+            ),
             "tool_calls": tool_calls,
             "planner_finish_status": finish_status,
             "pi05_checkpoint_path": trial.runtime.pi05_checkpoint_path,

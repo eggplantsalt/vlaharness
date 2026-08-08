@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -125,12 +126,24 @@ def test_setup_writer_is_idempotent_and_rejects_conflicting_retry(tmp_path: Path
 def test_positive_reference_artifact_uses_only_requested_positive_label(tmp_path: Path) -> None:
     dataset = OutcomeDataset.from_records((_outcome(1, True), _outcome(2, False)))
     artifact = build_positive_reference_artifact(
-        dataset, target="primitive_success"
+        dataset,
+        target="primitive_success",
+        source_dataset_fingerprint=dataset.fingerprint,
+        split_assignment_fingerprint="split-fixture",
     )
     assert len(artifact.references) == 1
     assert artifact.references[0].reference_id.endswith("outcome-1")
+    assert artifact.source_dataset_fingerprint == dataset.fingerprint
+    assert artifact.split_assignment_fingerprint == "split-fixture"
+    assert artifact.source_partition == "train"
     path = write_positive_reference_artifact(artifact, tmp_path / "positive.json")
     assert load_positive_reference_artifact(path) == artifact
+
+    mutated = json.loads(path.read_text(encoding="utf-8"))
+    mutated["references"][0]["target_relative_position_m"][2] = 0.5
+    path.write_text(json.dumps(mutated) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="identity mismatch"):
+        load_positive_reference_artifact(path)
 
 
 def test_positive_reference_artifact_rejects_privileged_geometry() -> None:
@@ -170,6 +183,10 @@ def test_positive_reference_artifact_rejects_privileged_geometry() -> None:
     )
 
     with pytest.raises(ProvenanceFirewallError, match="non-deployment"):
+        privileged_dataset = OutcomeDataset.from_records((privileged,))
         build_positive_reference_artifact(
-            (privileged,), target="primitive_success"
+            privileged_dataset,
+            target="primitive_success",
+            source_dataset_fingerprint=privileged_dataset.fingerprint,
+            split_assignment_fingerprint="split-fixture",
         )

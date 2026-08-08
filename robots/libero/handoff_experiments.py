@@ -15,6 +15,7 @@ import json
 import os
 import time
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -35,7 +36,11 @@ from robots.libero.handoff_runtime import (
     RuntimeEventSink,
     load_handoff_runtime_config,
 )
-from rpent.research.handoff.dataset import DatasetResearchSink, OutcomeDataset
+from rpent.research.handoff.dataset import (
+    DatasetResearchSink,
+    OutcomeDataset,
+    scan_decision_jsonl,
+)
 from rpent.research.handoff.experiments.config import RuntimeConfig, load_strict_json
 from rpent.research.handoff.experiments.gate0 import (
     Gate0Collector,
@@ -48,6 +53,10 @@ from rpent.research.handoff.experiments.sampling import (
     sample_world_position,
 )
 from rpent.research.handoff.experiments.setup_data import SetupJsonlWriter
+from rpent.research.handoff.experiments.runtime_identity import (
+    attest_runtime_checkpoint_clients,
+    write_runtime_attestation,
+)
 from rpent.research.handoff.privileged import ExperimentSetupRecord, SetupValue
 from rpent.research.handoff.types import (
     CandidateGeometry,
@@ -159,6 +168,7 @@ class Gate0ServerConfig(HandoffRecord):
                 "skill_success collection requires an explicit labeler_factory; "
                 "labels are never inferred from primitive/task success"
             )
+        _runtime_checkpoint_environment(self.runtime)
         return self
 
 
@@ -188,7 +198,49 @@ class LiberoGate0FactoryConfig(HandoffRecord):
             raise ValueError(
                 "skill_success Gate-0 data requires an explicit labeler_factory"
             )
+        _runtime_checkpoint_environment(self.runtime)
         return self
+
+
+def _runtime_checkpoint_environment(runtime: RuntimeConfig) -> dict[str, str]:
+    values = {
+        "PI05_CHECKPOINT_PATH": runtime.pi05_checkpoint_path,
+        "SAM3_CHECKPOINT_PATH": runtime.sam3_checkpoint_path,
+        "RPENT_PI05_CHECKPOINT_ID": runtime.pi05_checkpoint_id,
+        "RPENT_SAM3_CHECKPOINT_ID": runtime.sam3_checkpoint_id,
+    }
+    missing = sorted(name for name, value in values.items() if value is None)
+    if missing:
+        raise ValueError(
+            "Gate-0 runtime requires four checkpoint path/ID bindings: "
+            + ", ".join(missing)
+        )
+    return {name: str(value) for name, value in values.items()}
+
+
+@contextmanager
+def _injected_checkpoint_environment(runtime: RuntimeConfig):
+    values = _runtime_checkpoint_environment(runtime)
+    previous = {name: os.environ.get(name) for name in values}
+    try:
+        os.environ.update(values)
+        yield values
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _assert_checkpoint_environment(runtime: RuntimeConfig) -> None:
+    expected = _runtime_checkpoint_environment(runtime)
+    actual = {name: os.environ.get(name) for name in expected}
+    if actual != expected:
+        raise ValueError(
+            "Gate-0 child checkpoint environment disagrees with its job: "
+            f"expected={expected!r}, actual={actual!r}"
+        )
 
 
 def _resolve_config_paths(config: Gate0ServerConfig, source: Path) -> Gate0ServerConfig:
@@ -364,7 +416,10 @@ class LiberoGate0Adapter(LiberoGovernorAdapter):
             approach_axis_world=self._sampler_config.approach_axis_world,
         )
         requested = CandidateGeometry(
-            candidate_id=sample.sample_id,
+            # Geometry identity is repeat-invariant. ``sample_id`` identifies
+            # this execution attempt and belongs in the trial/outcome key, not
+            # in the requested candidate stored in privileged setup data.
+            candidate_id=sample.candidate_id,
             kind="perturbation",
             eef_position_m=desired_position,
             target_relative_position_m=tuple(
@@ -410,6 +465,18 @@ class LiberoGate0Adapter(LiberoGovernorAdapter):
             raise RuntimeError("current EEF position is unavailable or invalid")
         return tuple(float(item) for item in value)
 
+    def current_eef_quaternion_xyzw(self) -> tuple[float, float, float, float]:
+        raw = self.primitives.env.raw_obs()
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("LIBERO raw_obs did not return a state mapping")
+        value = np.asarray(raw.get("robot0_eef_quat"), dtype=np.float64)
+        if value.shape != (4,) or not np.isfinite(value).all():
+            raise RuntimeError("current EEF quaternion is unavailable or invalid")
+        norm = float(np.linalg.norm(value))
+        if norm < 1e-12:
+            raise RuntimeError("current EEF quaternion has zero norm")
+        return tuple(float(item / norm) for item in value)
+
     def label_outcome(self, result: Any) -> OutcomeLabels:
         if self._outcome_labeler is not None:
             labels = self._outcome_labeler(result)
@@ -447,8 +514,12 @@ def build_gate0_adapter_bundle(
     from robots.libero import get_env_spec
     from robots.libero.tools import LiberoPrimitives
     from rpent.dashboard.events import NullDashboardEventSink
+    from rpent.research.handoff.experiments.runtime import (
+        verify_gate0_job_external_bindings,
+    )
 
     config = LiberoGate0FactoryConfig.model_validate(adapter_config)
+    verify_gate0_job_external_bindings(job)
     handoff_path = Path(config.handoff_config).expanduser()
     if not handoff_path.is_absolute():
         handoff_path = Path.cwd() / handoff_path
@@ -456,6 +527,34 @@ def build_gate0_adapter_bundle(
     if not handoff.enabled:
         raise ValueError("Gate-0 adapter requires enabled=true handoff config")
     runtime = config.runtime
+    if job.external_bindings is None:
+        raise ValueError("Gate-0 adapter job lacks external bindings")
+    if handoff_path.resolve() != Path(
+        job.external_bindings.handoff_config_path
+    ):
+        raise ValueError("Gate-0 adapter handoff path disagrees with job binding")
+    if handoff.configuration_id != job.external_bindings.handoff_configuration_id:
+        raise ValueError("Gate-0 parsed handoff identity disagrees with job binding")
+    if handoff.controller_method != job.controller_method:
+        raise ValueError("Gate-0 job controller method disagrees with handoff config")
+    if handoff.checkpoint_id not in (None, job.checkpoint_id):
+        raise ValueError("Gate-0 handoff checkpoint ID disagrees with job")
+    if runtime.pi05_checkpoint_id != job.checkpoint_id:
+        raise ValueError("Gate-0 runtime Pi0.5 ID disagrees with job checkpoint")
+    if handoff.metadata.get("pi05_checkpoint_id") not in (
+        None,
+        runtime.pi05_checkpoint_id,
+    ):
+        raise ValueError("Gate-0 handoff metadata Pi0.5 ID disagrees with runtime")
+    if handoff.metadata.get("sam3_checkpoint_id") not in (
+        None,
+        runtime.sam3_checkpoint_id,
+    ):
+        raise ValueError("Gate-0 handoff metadata SAM3 ID disagrees with runtime")
+    _assert_checkpoint_environment(runtime)
+    plan_id = job.metadata.get("execution_plan_id")
+    if not isinstance(plan_id, str) or not plan_id:
+        raise ValueError("Gate-0 execution plan identity is missing")
     args = argparse.Namespace(
         suite=job.suite,
         task=int(job.task_id),
@@ -472,17 +571,46 @@ def build_gate0_adapter_bundle(
     daemons, primitive_kwargs = get_env_spec().init_runtime(
         args, output_dir, NullDashboardEventSink()
     )
-    primitive_kwargs.pop("_rpent_handoff_runtime_config", None)
-    telemetry = RuntimeEventSink(
-        output_dir / "telemetry",
-        configuration_id=handoff.configuration_id,
-        controller_configuration_id=handoff.controller_configuration_id,
-    )
-    instrumentation = RuntimeInstrumentation(
-        telemetry, enabled=handoff.instrumentation
-    )
-    prepared = instrument_primitives_kwargs(primitive_kwargs, instrumentation)
-    primitives = LiberoPrimitives(check_cancelled=lambda: None, **prepared)
+    try:
+        attestation = attest_runtime_checkpoint_clients(
+            primitive_kwargs,
+            runtime,
+            trial_id=f"{job.run_id}/gate0-runtime",
+            plan_id=plan_id,
+            source_revision=job.source_revision,
+        )
+        attestation_path = write_runtime_attestation(
+            attestation,
+            output_dir / "runtime_identity" / f"{plan_id}.json",
+        )
+        attestation_sha256 = hashlib.sha256(
+            attestation_path.read_bytes()
+        ).hexdigest()
+    except Exception:
+        for daemon in reversed(daemons):
+            daemon.stop()
+        raise
+    try:
+        primitive_kwargs.pop("_rpent_handoff_runtime_config", None)
+        telemetry = RuntimeEventSink(
+            output_dir / "telemetry",
+            configuration_id=handoff.configuration_id,
+            controller_configuration_id=handoff.controller_configuration_id,
+        )
+        instrumentation = RuntimeInstrumentation(
+            telemetry, enabled=handoff.instrumentation
+        )
+        prepared = instrument_primitives_kwargs(
+            primitive_kwargs, instrumentation
+        )
+        primitives = LiberoPrimitives(
+            check_cancelled=lambda: None,
+            **prepared,
+        )
+    except Exception:
+        for daemon in reversed(daemons):
+            daemon.stop()
+        raise
     try:
         provider = build_target_provider(handoff, primitives=primitives)
         labeler = None
@@ -520,7 +648,12 @@ def build_gate0_adapter_bundle(
         for daemon in reversed(daemons):
             daemon.stop()
 
-    return {"adapter": adapter, "cleanup": cleanup}
+    return {
+        "adapter": adapter,
+        "runtime_attestation": attestation,
+        "runtime_attestation_sha256": attestation_sha256,
+        "cleanup": cleanup,
+    }
 
 
 def run_gate0_server(
@@ -542,26 +675,98 @@ def run_gate0_server(
     handoff_config = load_handoff_runtime_config(config.handoff_config)
     if not handoff_config.enabled:
         raise ValueError("Gate-0 requires enabled=true handoff runtime config")
+    if handoff_config.checkpoint_id not in (
+        None,
+        config.runtime.pi05_checkpoint_id,
+    ):
+        raise ValueError(
+            "legacy Gate-0 handoff checkpoint ID disagrees with runtime Pi0.5 ID"
+        )
+    if handoff_config.metadata.get("pi05_checkpoint_id") not in (
+        None,
+        config.runtime.pi05_checkpoint_id,
+    ) or handoff_config.metadata.get("sam3_checkpoint_id") not in (
+        None,
+        config.runtime.sam3_checkpoint_id,
+    ):
+        raise ValueError(
+            "legacy Gate-0 handoff metadata checkpoint IDs disagree with runtime"
+        )
+    if config.source_revision is not None:
+        from rpent.research.handoff.experiments.manifest import (
+            compute_source_revision,
+        )
+
+        current_source = compute_source_revision(Path.cwd())
+        if current_source != config.source_revision:
+            raise ValueError(
+                "current source bytes disagree with legacy Gate-0 config: "
+                f"expected={config.source_revision!r}, actual={current_source!r}"
+            )
 
     events = NullDashboardEventSink()
     env_spec = get_env_spec()
-    daemons, primitives_kwargs = env_spec.init_runtime(
-        _runtime_namespace(config), output_dir, events
-    )
-    primitives_kwargs.pop("_rpent_handoff_runtime_config", None)
-    record_dir = output_dir / "records"
-    dataset_sink = DatasetResearchSink(record_dir, fsync=config.fsync)
-    telemetry_sink = RuntimeEventSink(
-        output_dir / "telemetry",
-        configuration_id=handoff_config.configuration_id,
-        controller_configuration_id=handoff_config.controller_configuration_id,
-    )
-    sink = CompositeResearchSink([dataset_sink, telemetry_sink])
-    instrumentation = RuntimeInstrumentation(
-        sink, enabled=handoff_config.instrumentation
-    )
-    prepared = instrument_primitives_kwargs(primitives_kwargs, instrumentation)
-    primitives = LiberoPrimitives(check_cancelled=lambda: None, **prepared)
+    with _injected_checkpoint_environment(config.runtime):
+        daemons, primitives_kwargs = env_spec.init_runtime(
+            _runtime_namespace(config), output_dir, events
+        )
+    try:
+        attestation = attest_runtime_checkpoint_clients(
+            primitives_kwargs,
+            config.runtime,
+            trial_id=f"{config.run_id}/legacy-gate0-runtime",
+            source_revision=config.source_revision,
+        )
+        attestation_path = write_runtime_attestation(
+            attestation,
+            output_dir / "runtime_identity.json",
+        )
+        attestation_sha256 = hashlib.sha256(
+            attestation_path.read_bytes()
+        ).hexdigest()
+    except Exception:
+        for daemon in reversed(daemons):
+            daemon.stop()
+        raise
+    try:
+        primitives_kwargs.pop("_rpent_handoff_runtime_config", None)
+        record_dir = output_dir / "records"
+        outcome_path = record_dir / "outcomes.jsonl"
+        existing_outcomes = ()
+        if outcome_path.exists() and outcome_path.stat().st_size:
+            existing_outcomes = OutcomeDataset.from_jsonl(
+                outcome_path,
+                allow_partial_final_line=False,
+            ).records
+        decision_path = record_dir / "decisions.jsonl"
+        if decision_path.exists() and decision_path.stat().st_size:
+            scan_decision_jsonl(
+                decision_path,
+                allow_partial_final_line=False,
+            )
+        dataset_sink = DatasetResearchSink(record_dir, fsync=config.fsync)
+        telemetry_sink = RuntimeEventSink(
+            output_dir / "telemetry",
+            configuration_id=handoff_config.configuration_id,
+            controller_configuration_id=(
+                handoff_config.controller_configuration_id
+            ),
+        )
+        sink = CompositeResearchSink([dataset_sink, telemetry_sink])
+        instrumentation = RuntimeInstrumentation(
+            sink, enabled=handoff_config.instrumentation
+        )
+        prepared = instrument_primitives_kwargs(
+            primitives_kwargs, instrumentation
+        )
+        primitives = LiberoPrimitives(
+            check_cancelled=lambda: None,
+            **prepared,
+        )
+    except Exception:
+        for daemon in reversed(daemons):
+            daemon.stop()
+        raise
     try:
         target_provider = build_target_provider(handoff_config, primitives=primitives)
         core_api = CoreRuntimeAPI.load(handoff_config.governor_api_module)
@@ -591,12 +796,30 @@ def run_gate0_server(
             sampler_config=config.gate0.sampler,
             outcome_labeler=labeler,
         )
-        outcome_path = record_dir / "outcomes.jsonl"
         completed = ()
-        if outcome_path.exists() and outcome_path.stat().st_size:
+        if existing_outcomes:
+            invalid_existing = [
+                record.record_id
+                for record in existing_outcomes
+                if (
+                    record.source_revision != config.source_revision
+                    or record.controller.checkpoint_id
+                    != config.runtime.pi05_checkpoint_id
+                    or record.metadata.get("gate0_configuration_id")
+                    != handoff_config.configuration_id
+                    or record.metadata.get("runtime_attestation_id")
+                    != attestation.attestation_id
+                    or record.metadata.get("runtime_attestation_sha256")
+                    != attestation_sha256
+                )
+            ]
+            if invalid_existing:
+                raise ValueError(
+                    "legacy Gate-0 outcomes disagree with the live runtime "
+                    f"identity: {invalid_existing[:10]}"
+                )
             completed = tuple(
-                record.identity.trial_id
-                for record in OutcomeDataset.from_jsonl(outcome_path).records
+                record.identity.trial_id for record in existing_outcomes
             )
         collector = Gate0Collector(
             adapter=adapter,
@@ -609,7 +832,7 @@ def run_gate0_server(
             controller=ControllerIdentity(
                 method="gate0_direct_frozen_pi0",
                 implementation_version="rpent-libero-gate0/v1",
-                checkpoint_id=handoff_config.checkpoint_id,
+                checkpoint_id=config.runtime.pi05_checkpoint_id,
                 configuration_id=handoff_config.controller_configuration_id,
             ),
             run_identity=Gate0RunIdentity(
@@ -618,6 +841,9 @@ def run_gate0_server(
                 task_id=config.task.task,
                 seed=config.task.seed,
                 source_revision=config.source_revision,
+                configuration_id=handoff_config.configuration_id,
+                runtime_attestation_id=attestation.attestation_id,
+                runtime_attestation_sha256=attestation_sha256,
             ),
             outcome_sink=sink,
             setup_sink=SetupJsonlWriter(

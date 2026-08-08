@@ -19,7 +19,9 @@ from rpent.research.handoff.experiments.config import (
 )
 from rpent.research.handoff.experiments.manifest import (
     ExperimentManifest,
+    compute_source_revision,
     expand_manifest,
+    verify_manifest_external_bindings,
 )
 from rpent.research.handoff.types import HandoffRecord
 
@@ -116,6 +118,19 @@ def _nearest_existing_parent(path: Path) -> Path:
     while not candidate.exists() and candidate != candidate.parent:
         candidate = candidate.parent
     return candidate
+
+
+def _repository_root(start: Path) -> Path:
+    """Locate the byte-identity root without depending on caller cwd."""
+    resolved = start.expanduser().resolve()
+    if resolved.is_file():
+        resolved = resolved.parent
+    for candidate in (resolved, *resolved.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    raise FileNotFoundError(
+        f"could not locate a Git worktree from {resolved}"
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -331,6 +346,27 @@ def _handoff_config_checks(
             },
         )
     )
+    core = runtime_config.canonical_config.get("core", {})
+    feature_spec = core.get("feature_spec", {}) if isinstance(core, dict) else {}
+    runtime_preset = (
+        feature_spec.get("preset") if isinstance(feature_spec, dict) else None
+    )
+    preset_ok = runtime_preset == condition.feature_set.value
+    checks.append(
+        PreflightCheck(
+            name=f"{name}.feature_binding",
+            status=CheckStatus.PASS if preset_ok else CheckStatus.FAIL,
+            message=(
+                "runtime feature representation matches the matrix condition"
+                if preset_ok
+                else "runtime feature representation differs from the condition"
+            ),
+            details={
+                "runtime": runtime_preset,
+                "condition": condition.feature_set.value,
+            },
+        )
+    )
     if condition.checkpoint_id is not None:
         checkpoint_ok = runtime_config.checkpoint_id == condition.checkpoint_id
         checks.append(
@@ -402,7 +438,11 @@ def run_offline_preflight(
     This function performs no writes. Runtime capability checks belong to the
     separate server probe surface.
     """
-    expected_manifest = expand_manifest(config, config_path=config_path)
+    expected_manifest = expand_manifest(
+        config,
+        config_path=config_path,
+        require_artifacts=require_referenced_paths,
+    )
     resolved_manifest = manifest or expected_manifest
     checks: list[PreflightCheck] = []
 
@@ -427,21 +467,11 @@ def run_offline_preflight(
             )
         )
 
-    expected_trials = [
-        trial.model_dump(mode="json", exclude_none=False)
-        for trial in expected_manifest.trials
-    ]
-    actual_trials = [
-        trial.model_dump(mode="json", exclude_none=False)
-        for trial in resolved_manifest.trials
-    ]
-    expansion_matches = (
-        resolved_manifest.manifest_id == expected_manifest.manifest_id
-        and resolved_manifest.experiment_id == expected_manifest.experiment_id
-        and resolved_manifest.source_config_path
-        == expected_manifest.source_config_path
-        and actual_trials == expected_trials
-    )
+    expected_payload = expected_manifest.model_dump(mode="json", exclude_none=False)
+    actual_payload = resolved_manifest.model_dump(mode="json", exclude_none=False)
+    expected_trials = expected_payload["trials"]
+    actual_trials = actual_payload["trials"]
+    expansion_matches = actual_payload == expected_payload
     checks.append(
         PreflightCheck(
             name="manifest_expansion",
@@ -459,6 +489,77 @@ def run_offline_preflight(
             },
         )
     )
+
+    if config.runtime_probes:
+        try:
+            verify_manifest_external_bindings(
+                resolved_manifest,
+                require_runtime_probes=True,
+            )
+        except Exception as exc:
+            checks.append(
+                PreflightCheck(
+                    name="external_artifact_bindings",
+                    status=CheckStatus.FAIL,
+                    message="manifest-bound runtime/artifact bytes are unavailable or changed",
+                    details={"error": str(exc)},
+                )
+            )
+        else:
+            checks.append(
+                PreflightCheck(
+                    name="external_artifact_bindings",
+                    status=CheckStatus.PASS,
+                    message="all manifest-bound runtime probe and artifact bytes match",
+                )
+            )
+
+    exact_source_identity = ";worktree-sha256:" in config.source_revision
+    if exact_source_identity:
+        try:
+            source_root = _repository_root(
+                Path(config_path) if config_path is not None else Path.cwd()
+            )
+            actual_source_revision = compute_source_revision(source_root)
+        except Exception as exc:
+            checks.append(
+                PreflightCheck(
+                    name="source_revision",
+                    status=CheckStatus.FAIL,
+                    message="could not recompute repository source identity",
+                    details={"error": str(exc)},
+                )
+            )
+        else:
+            source_ok = actual_source_revision == config.source_revision
+            checks.append(
+                PreflightCheck(
+                    name="source_revision",
+                    status=CheckStatus.PASS if source_ok else CheckStatus.FAIL,
+                    message=(
+                        "repository bytes match the configured source identity"
+                        if source_ok
+                        else "repository bytes differ from the configured source identity"
+                    ),
+                    details={
+                        "configured": config.source_revision,
+                        "actual": actual_source_revision,
+                        "repository_root": str(source_root),
+                    },
+                )
+            )
+    else:
+        checks.append(
+            PreflightCheck(
+                name="source_revision",
+                status=CheckStatus.WARNING,
+                message=(
+                    "source revision is declared but not in exact commit+worktree form; "
+                    "research execution will require exact byte identity"
+                ),
+                details={"configured": config.source_revision},
+            )
+        )
 
     task_bound_cells = {
         (trial.task.suite, trial.task.task, trial.task.seed)

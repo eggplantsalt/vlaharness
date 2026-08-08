@@ -125,12 +125,13 @@ class VLAFacade(RpcFacade):
     single-env inference and returns a JSON-safe dict.
     """
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, checkpoint_id: str | None = None):
         super().__init__()
         from rlinf.models.embodiment.openpi import get_model as get_openpi_model
 
         cfg = build_model_cfg(model_path=model_path)
         self._model_path = str(Path(model_path).expanduser().resolve())
+        self._checkpoint_id = checkpoint_id
         self._model_cfg = cfg
         t0 = time.time()
         logger.info("loading Pi0.5 (model_path=%s) ...", cfg["model_path"])
@@ -165,6 +166,7 @@ class VLAFacade(RpcFacade):
         path = Path(self._model_path)
         checkpoint_stat: dict[str, Any] = {
             "path": self._model_path,
+            "configured_id": self._checkpoint_id,
             "exists": path.exists(),
             "is_file": path.is_file(),
             "is_dir": path.is_dir(),
@@ -236,6 +238,11 @@ def main() -> None:
         default=None,
         help="Pi0.5 checkpoint (defaults to PI05_CHECKPOINT_PATH env)",
     )
+    p.add_argument(
+        "--checkpoint-id",
+        default=None,
+        help="Immutable checkpoint content identity (or RPENT_PI05_CHECKPOINT_ID).",
+    )
     p.add_argument("--parent-watch", action="store_true",
                    help="watch parent process via stdin pipe and exit when it dies")
     p.add_argument("--cuda-device", type=int, default=None,
@@ -259,7 +266,10 @@ def main() -> None:
             "path via --model-path or the environment."
         )
 
-    facade = VLAFacade(model_path=model_path)
+    checkpoint_id = args.checkpoint_id or os.environ.get(
+        "RPENT_PI05_CHECKPOINT_ID"
+    )
+    facade = VLAFacade(model_path=model_path, checkpoint_id=checkpoint_id)
     facade.serve(transport=args.transport, host=args.host, port=args.port,
                  parent_watch=args.parent_watch)
 

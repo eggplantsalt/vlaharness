@@ -203,6 +203,33 @@ class RuntimeConfig(HandoffRecord):
         return value
 
 
+class RuntimeProbeReference(HandoffRecord):
+    """One named, content-bound runtime probe required by a matrix."""
+
+    name: str
+    path: str
+    required_observed_facts: tuple[str, ...] = ()
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, value: str) -> str:
+        return _safe_identifier(value, "runtime probe name")
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        return _non_empty(value, "runtime probe path")
+
+    @field_validator("required_observed_facts")
+    @classmethod
+    def validate_required_facts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not item for item in value):
+            raise ValueError("runtime probe fact names must be non-empty")
+        if len(value) != len(set(value)):
+            raise ValueError("runtime probe fact names must be unique")
+        return value
+
+
 class PlannerConfig(HandoffRecord):
     """Full-agent planner settings; ignored by controller-only runners."""
 
@@ -396,8 +423,9 @@ class ExperimentConfig(HandoffRecord):
     tasks: tuple[TaskSpec, ...]
     conditions: tuple[ConditionSpec, ...]
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    runtime_probes: tuple[RuntimeProbeReference, ...] = ()
     planner: PlannerConfig = Field(default_factory=PlannerConfig)
-    source_revision: str | None = None
+    source_revision: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("experiment_id")
@@ -415,9 +443,7 @@ class ExperimentConfig(HandoffRecord):
 
     @field_validator("source_revision")
     @classmethod
-    def validate_optional_text(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
+    def validate_source_revision(cls, value: str) -> str:
         return _non_empty(value, "source_revision")
 
     @field_validator("metadata")
@@ -434,9 +460,29 @@ class ExperimentConfig(HandoffRecord):
         names = [condition.name for condition in self.conditions]
         if len(names) != len(set(names)):
             raise ValueError("condition names must be unique")
+        probe_names = [probe.name for probe in self.runtime_probes]
+        if len(probe_names) != len(set(probe_names)):
+            raise ValueError("runtime probe names must be unique")
         task_keys = [(task.suite, task.task) for task in self.tasks]
         if len(task_keys) != len(set(task_keys)):
             raise ValueError("suite/task entries must be unique")
+        if self.runtime.pi05_checkpoint_id is None:
+            raise ValueError("runtime.pi05_checkpoint_id is required")
+        if self.runtime.sam3_checkpoint_id is None:
+            raise ValueError("runtime.sam3_checkpoint_id is required")
+        has_full_agent = any(
+            condition.execution_layer is ExecutionLayer.FULL_AGENT
+            for condition in self.conditions
+        )
+        if has_full_agent:
+            if self.planner.model is None:
+                raise ValueError(
+                    "full-agent conditions require an explicit planner.model"
+                )
+            if self.planner.backend == "api" and self.planner.base_url is None:
+                raise ValueError(
+                    "API full-agent conditions require an explicit planner.base_url"
+                )
         return self
 
     @property

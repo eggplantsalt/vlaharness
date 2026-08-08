@@ -28,6 +28,7 @@ from pydantic import Field, field_validator, model_validator
 from rpent.research.handoff.types import HandoffRecord
 
 RUNTIME_PROBE_SCHEMA_VERSION = "rpent.handoff-runtime-probe/v1"
+RUNTIME_PROBE_ARTIFACT_SCHEMA_VERSION = "rpent.runtime-probe-artifact/v1"
 
 
 class ProbeStatus(str, Enum):
@@ -274,6 +275,43 @@ class RuntimeProbeReport(HandoffRecord):
             for fact in self.facts
             if fact.status is ProbeStatus.REQUIRES_DIAGNOSTIC
         )
+
+
+class RuntimeProbeArtifact(HandoffRecord):
+    """Typed, persistable envelope for one CLI probe run."""
+
+    schema_version: Literal[RUNTIME_PROBE_ARTIFACT_SCHEMA_VERSION] = (
+        RUNTIME_PROBE_ARTIFACT_SCHEMA_VERSION
+    )
+    report: RuntimeProbeReport
+    timestamp_utc: str
+    ok: bool
+    probe_calls_ok: bool
+    readiness_ok: bool
+    required_observed_facts: tuple[str, ...] = ()
+    required_facts_not_observed: tuple[str, ...] = ()
+    checkpoint_identity_mismatches: tuple[dict[str, Any], ...] = ()
+    captured_vla_observation_npz: str | None = None
+    pending_diagnostics: tuple[str, ...] = ()
+
+    @field_validator("timestamp_utc")
+    @classmethod
+    def validate_timestamp(cls, value: str) -> str:
+        if not value:
+            raise ValueError("timestamp_utc must be non-empty")
+        return value
+
+    @model_validator(mode="after")
+    def validate_readiness(self):
+        if self.ok != self.readiness_ok:
+            raise ValueError("probe artifact ok must equal readiness_ok")
+        if self.readiness_ok and (
+            not self.probe_calls_ok
+            or self.required_facts_not_observed
+            or self.checkpoint_identity_mismatches
+        ):
+            raise ValueError("ready probe artifact contains unresolved failures")
+        return self
 
 
 class RuntimeProbeClient(Protocol):
@@ -840,13 +878,36 @@ def _identity_fact(
             source=source,
             detail=f"{component} probe exposed no model/checkpoint identity",
         )
-    if model_class is None or checkpoint is None:
-        missing = "model_class" if model_class is None else "checkpoint"
+    if not isinstance(model_class, str) or not model_class or not isinstance(
+        checkpoint, Mapping
+    ):
+        missing = "model_class" if not model_class else "checkpoint"
         return _requires(
             name,
             component,
             source=source,
             detail=f"{component} probe identity is partial; {missing} is absent",
+            value=value,
+        )
+    path = checkpoint.get("path")
+    configured_id = checkpoint.get("configured_id")
+    exists = checkpoint.get("exists")
+    missing_fields = []
+    if not isinstance(path, str) or not path:
+        missing_fields.append("checkpoint.path")
+    if not isinstance(configured_id, str) or not configured_id:
+        missing_fields.append("checkpoint.configured_id")
+    if exists is not True:
+        missing_fields.append("checkpoint.exists=true")
+    if missing_fields:
+        return _requires(
+            name,
+            component,
+            source=source,
+            detail=(
+                f"{component} checkpoint identity is not execution-ready: "
+                + ", ".join(missing_fields)
+            ),
             value=value,
         )
     return _observed(name, component, value, source=source)
@@ -1521,8 +1582,10 @@ __all__ = [
     "ProbeStatus",
     "REQUIRED_RUNTIME_FACTS",
     "RUNTIME_PROBE_SCHEMA_VERSION",
+    "RUNTIME_PROBE_ARTIFACT_SCHEMA_VERSION",
     "RuntimeProbeClient",
     "RuntimeProbeOptions",
+    "RuntimeProbeArtifact",
     "RuntimeProbeReport",
     "Sam3ProbeClient",
     "probe_local_versions",

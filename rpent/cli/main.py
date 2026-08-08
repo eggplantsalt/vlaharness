@@ -283,14 +283,80 @@ def main() -> int:
     completion_output = getattr(args, "research_completion_output", None)
     research_trial_id = getattr(args, "research_trial_id", None)
     if completion_output is not None:
+        from rpent.research.handoff.experiments.config import load_strict_json
+        from rpent.research.handoff.experiments.runtime_identity import (
+            verify_runtime_attestation_binding,
+        )
+
         destination = Path(completion_output).expanduser().resolve()
         if destination.exists():
             raise FileExistsError(
                 f"research completion sidecar already exists: {destination}"
             )
+        trial = getattr(args, "_rpent_research_trial_manifest", None)
+        if trial is None or trial.trial_id != research_trial_id:
+            raise RuntimeError("research completion lacks its validated manifest trial")
+        runtime_identity_path = Path(
+            args.research_runtime_identity_output
+        ).expanduser().resolve()
+        attestation, runtime_attestation_sha256 = (
+            verify_runtime_attestation_binding(
+                runtime_identity_path,
+                trial_id=trial.trial_id,
+                manifest_id=str(args.research_manifest_id),
+                plan_id=str(args.research_plan_id),
+                source_revision=trial.source_revision,
+            )
+        )
+        reset_identity_path = Path(
+            args.research_reset_identity_output
+        ).expanduser().resolve()
+        reset_identity = load_strict_json(reset_identity_path)
+        expected_reset_fields = {
+            "schema_version": "rpent.research-reset-identity/v1",
+            "trial_id": trial.trial_id,
+            "manifest_id": str(args.research_manifest_id),
+            "plan_id": str(args.research_plan_id),
+            "source_revision": trial.source_revision,
+            "suite": trial.task.suite,
+            "task": trial.task.task,
+            "seed": trial.task.seed,
+            "max_episode_steps": trial.runtime.max_episode_steps,
+            "observed_after_reset": True,
+            "source": "live_env_runtime_probe",
+            "probe_schema_version": "rpent.runtime-probe/v1",
+            "probe_component": "libero_env",
+            "runtime_attestation_id": attestation.attestation_id,
+            "runtime_attestation_sha256": runtime_attestation_sha256,
+        }
+        reset_mismatches = {
+            field: {"expected": expected, "actual": reset_identity.get(field)}
+            for field, expected in expected_reset_fields.items()
+            if reset_identity.get(field) != expected
+        }
+        reset_id = reset_identity.get("reset_id")
+        if reset_mismatches or not isinstance(reset_id, str) or not reset_id:
+            raise RuntimeError(
+                "research reset sidecar disagrees with completion identity: "
+                f"mismatches={reset_mismatches!r}, reset_id={reset_id!r}"
+            )
+        reset_identity_sha256 = hashlib.sha256(
+            reset_identity_path.read_bytes()
+        ).hexdigest()
+        direct_vla_attempts_path = (
+            Path(output_dir) / "direct_vla_attempts.jsonl"
+        ).resolve()
+        direct_vla_attempts_sha256 = (
+            hashlib.sha256(direct_vla_attempts_path.read_bytes()).hexdigest()
+            if direct_vla_attempts_path.is_file()
+            else None
+        )
         completion_record = {
             "schema_version": "rpent.research-completion/v1",
             "trial_id": str(research_trial_id),
+            "manifest_id": str(args.research_manifest_id),
+            "plan_id": str(args.research_plan_id),
+            "source_revision": trial.source_revision,
             "status": (
                 "planner_error"
                 if agent_error
@@ -306,30 +372,34 @@ def main() -> int:
                 transcript_path.read_bytes()
             ).hexdigest(),
             "elapsed_s": round(elapsed, 1),
+            "planner_backend": args.planner,
+            "planner_model": args.model,
+            "planner_base_url": args.base_url,
+            "runtime_attestation_id": attestation.attestation_id,
+            "runtime_attestation_path": str(runtime_identity_path),
+            "runtime_attestation_sha256": runtime_attestation_sha256,
+            "reset_id": reset_id,
+            "reset_identity_path": str(reset_identity_path),
+            "reset_identity_sha256": reset_identity_sha256,
+            "direct_vla_attempts_path": (
+                str(direct_vla_attempts_path)
+                if direct_vla_attempts_sha256 is not None
+                else None
+            ),
+            "direct_vla_attempts_sha256": direct_vla_attempts_sha256,
         }
-        temporary = destination.with_name(f".{destination.name}.tmp")
-        if temporary.exists():
-            raise FileExistsError(
-                f"research completion temporary already exists: {temporary}"
+        with destination.open("x", encoding="utf-8", newline="\n") as stream:
+            json.dump(
+                completion_record,
+                stream,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
             )
-        try:
-            with temporary.open("x", encoding="utf-8") as stream:
-                json.dump(
-                    completion_record,
-                    stream,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    indent=2,
-                    allow_nan=False,
-                )
-                stream.write("\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, destination)
-        except Exception:
-            if temporary.exists():
-                temporary.unlink()
-            raise
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
 
     logger.info("elapsed: %.1fs", elapsed)
     logger.info("usage: in=%s out=%s tool_calls=%s",
@@ -340,6 +410,8 @@ def main() -> int:
     if agent_error:
         logger.error("error: %s", agent_error)
 
+    if completion_output is not None and agent_error:
+        return 1
     return 0
 
 

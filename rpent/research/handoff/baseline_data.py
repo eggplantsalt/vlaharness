@@ -39,6 +39,9 @@ class PositiveReferenceArtifact(HandoffRecord):
     )
     artifact_id: str
     dataset_fingerprint: str
+    source_dataset_fingerprint: str
+    split_assignment_fingerprint: str
+    source_partition: Literal["train"] = "train"
     target_label: TrainingTarget
     deployment_provenance_verified: Literal[True]
     build_settings: PositiveReferenceBuildSettings
@@ -46,7 +49,12 @@ class PositiveReferenceArtifact(HandoffRecord):
     references: tuple[PositiveReference, ...]
     excluded_counts: dict[str, int] = Field(default_factory=dict)
 
-    @field_validator("artifact_id", "dataset_fingerprint")
+    @field_validator(
+        "artifact_id",
+        "dataset_fingerprint",
+        "source_dataset_fingerprint",
+        "split_assignment_fingerprint",
+    )
     @classmethod
     def validate_text(cls, value: str, info) -> str:
         if not value:
@@ -101,6 +109,8 @@ def build_positive_reference_artifact(
     dataset: OutcomeDataset | Sequence[OutcomeRecord],
     *,
     target: TrainingTarget | str,
+    source_dataset_fingerprint: str,
+    split_assignment_fingerprint: str,
     maximum_references: int | None = None,
 ) -> PositiveReferenceArtifact:
     resolved = (
@@ -169,6 +179,9 @@ def build_positive_reference_artifact(
     artifact_without_id = PositiveReferenceArtifact(
         artifact_id="pending",
         dataset_fingerprint=resolved.fingerprint,
+        source_dataset_fingerprint=source_dataset_fingerprint,
+        split_assignment_fingerprint=split_assignment_fingerprint,
+        source_partition="train",
         target_label=TrainingTarget(target),
         deployment_provenance_verified=True,
         build_settings=PositiveReferenceBuildSettings(

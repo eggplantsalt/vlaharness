@@ -34,6 +34,7 @@ from rpent.research.handoff.types import (
     TerminationReason,
     TrialIdentity,
     HandoffState,
+    outcome_record_id,
     unavailable_signal,
 )
 
@@ -128,6 +129,23 @@ class RuntimeErrorWithCancellationName(Exception):
 RuntimeErrorWithCancellationName.__name__ = "CancelledError"
 
 
+class _LabelFailureAdapter(_FakeAdapter):
+    def label_outcome(self, result):
+        del result
+        raise ValueError("fixture labeler failure")
+
+
+class _VlaExceptionAdapter(_FakeAdapter):
+    def __init__(self, exception: BaseException) -> None:
+        super().__init__()
+        self.exception = exception
+
+    def execute_vla(self, invocation):
+        del invocation
+        self.vla_calls += 1
+        raise self.exception
+
+
 def _governor(policy, sink, *, fallback=FallbackMode.ABORT):
     return HandoffGovernor(
         policy=policy,
@@ -182,3 +200,63 @@ def test_cancellation_after_handoff_preserves_attempt_and_pre_handoff_state() ->
     assert result.outcome.costs.vla_invocations == 1
     assert result.outcome.termination.reason is TerminationReason.CANCELLED
     assert result.outcome.termination.failure_mode is FailureMode.CANCELLATION
+
+
+def test_label_failure_after_vla_is_an_explicit_nontraining_outcome() -> None:
+    sink = InMemoryResearchSink()
+    result = _governor(DirectHandoffPolicy(), sink).run(
+        _LabelFailureAdapter(),
+        _invocation(),
+    )
+
+    assert result.outcome.handoff_occurred
+    assert result.outcome.costs.vla_invocations == 1
+    assert result.outcome.labels.primitive_success.value is None
+    assert result.outcome.termination.reason is TerminationReason.OUTCOME_LABEL_FAILURE
+    assert result.outcome.termination.failure_mode is FailureMode.OUTCOME_LABEL
+    assert result.outcome.termination.final_governor_state is GovernorState.OUTCOME_LABEL_FAILURE
+
+
+@pytest.mark.parametrize(
+    ("exception", "expected_reason", "expected_mode"),
+    (
+        (TimeoutError("VLA timed out"), TerminationReason.TIMEOUT, FailureMode.TIMEOUT),
+        (
+            ConnectionError("RPC transport disconnected"),
+            TerminationReason.RPC_FAILURE,
+            FailureMode.RPC,
+        ),
+    ),
+)
+def test_vla_transport_exceptions_are_classified_and_counted(
+    exception,
+    expected_reason,
+    expected_mode,
+) -> None:
+    sink = InMemoryResearchSink()
+    result = _governor(DirectHandoffPolicy(), sink).run(
+        _VlaExceptionAdapter(exception),
+        _invocation(),
+    )
+
+    assert result.outcome.handoff_occurred
+    assert result.outcome.costs.vla_invocations == 1
+    assert result.outcome.termination.reason is expected_reason
+    assert result.outcome.termination.failure_mode is expected_mode
+    assert result.outcome.labels.primitive_success.value is None
+
+
+def test_outcome_record_identity_is_result_independent_and_retry_stable() -> None:
+    identity = _invocation().identity
+    retry_context = identity.model_copy(
+        update={
+            "candidate_id": "different-candidate-detail",
+            "reset_id": "same-invocation-observed-differently",
+            "repeat_index": 9,
+        }
+    )
+
+    assert outcome_record_id(identity) == outcome_record_id(retry_context)
+    assert outcome_record_id(identity) != outcome_record_id(
+        identity.model_copy(update={"invocation_id": "inv-2"})
+    )

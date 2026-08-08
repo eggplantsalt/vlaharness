@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from rpent.research.handoff.candidates import (
     CandidateGeneratorConfig,
     ObjectRelativeCandidateGenerator,
+    wrist_yaw_pitch,
 )
 from rpent.research.handoff.experiments.sampling import (
     Gate0Sample,
@@ -47,6 +49,7 @@ from rpent.research.handoff.types import (
     TerminationRecord,
     TimingRecord,
     TrialIdentity,
+    outcome_record_id,
     unavailable_signal,
 )
 
@@ -56,6 +59,7 @@ class Gate0Config(BaseModel):
 
     sampler: Gate0SamplerConfig
     staging_tolerance_m: float = Field(default=0.012, gt=0.0)
+    staging_orientation_tolerance_rad: float = Field(default=0.05, gt=0.0)
     staging_step_m: float = Field(default=0.025, gt=0.0)
     max_staging_steps: int = Field(default=80, ge=1)
     max_staging_distance_m: float = Field(default=0.5, gt=0.0)
@@ -85,6 +89,9 @@ class Gate0Adapter(GovernorAdapter, Protocol):
     def current_eef_position_m(self) -> tuple[float, float, float]:
         """Read whitelisted proprioception without object ground truth."""
 
+    def current_eef_quaternion_xyzw(self) -> tuple[float, float, float, float]:
+        """Read measured EEF orientation without object ground truth."""
+
 
 @runtime_checkable
 class SetupSink(Protocol):
@@ -105,15 +112,42 @@ class Gate0RunIdentity:
     seed: int
     episode_prefix: str = "gate0"
     source_revision: str | None = None
+    configuration_id: str | None = None
+    execution_plan_id: str | None = None
+    runtime_attestation_id: str | None = None
+    runtime_attestation_sha256: str | None = None
 
 
-def _outcome_id(identity: TrialIdentity, reason: TerminationReason) -> str:
-    payload = json.dumps(
-        [identity.model_dump(mode="json"), reason.value],
+def _matched_cohort_id(
+    identity: TrialIdentity,
+    *,
+    skill: SkillIdentity,
+    source_revision: str | None,
+) -> str | None:
+    """Identify candidates executed from the same pinned reset/repeat cell."""
+    if identity.reset_id is None:
+        return None
+    payload = {
+        "schema_version": "rpent.handoff-gate0-matched-cohort/v1",
+        "run_id": identity.run_id,
+        "suite": identity.suite,
+        "task_id": identity.task_id,
+        "seed": identity.seed,
+        "reset_id": identity.reset_id,
+        "repeat_index": identity.repeat_index,
+        "skill": skill.model_dump(mode="json", exclude_none=False),
+        "source_revision": source_revision,
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     )
-    return "outcome-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:20]
+    return "gate0-cohort-" + hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()[:20]
 
 
 def _failure_labels(status: EpisodeStatus) -> OutcomeLabels:
@@ -150,10 +184,11 @@ def _failure_outcome(
     staging_distance_m: float,
     staging_time_s: float,
     source_revision: str | None,
+    metadata: Mapping[str, Any],
 ) -> OutcomeRecord:
     ended = time.monotonic()
     return OutcomeRecord(
-        record_id=_outcome_id(identity, reason),
+        record_id=outcome_record_id(identity),
         identity=identity,
         skill=skill,
         controller=controller,
@@ -182,7 +217,36 @@ def _failure_outcome(
         ),
         setup_record_id=setup_record_id,
         source_revision=source_revision,
-        metadata={"execution_layer": "gate0"},
+        metadata={"execution_layer": "gate0", **dict(metadata)},
+    )
+
+
+def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return tuple(chain)
+
+
+def _is_timeout_failure(exc: BaseException) -> bool:
+    return any(
+        isinstance(item, TimeoutError)
+        or "timeout" in item.__class__.__name__.lower()
+        or "timed out" in str(item).lower()
+        for item in _exception_chain(exc)
+    )
+
+
+def _is_rpc_failure(exc: BaseException) -> bool:
+    tokens = ("rpc", "http", "socket", "transport", "connection")
+    return any(
+        isinstance(item, (ConnectionError, BrokenPipeError))
+        or any(token in item.__class__.__name__.lower() for token in tokens)
+        for item in _exception_chain(exc)
     )
 
 
@@ -226,7 +290,7 @@ class Gate0Collector:
             ),
             trial_id=f"{self.run_identity.episode_prefix}-trial-{sample.sample_id}",
             invocation_id=f"{self.run_identity.episode_prefix}-vla-{sample.sample_id}",
-            candidate_id=sample.sample_id,
+            candidate_id=sample.candidate_id,
             suite=self.run_identity.suite,
             task_id=self.run_identity.task_id,
             seed=self.run_identity.seed,
@@ -258,19 +322,28 @@ class Gate0Collector:
         staging_time = 0.0
         setup: Gate0Setup | None = None
         resolved_identity = identity
+        cohort_id: str | None = None
+        phase = "reset_or_setup"
         try:
             setup = self.adapter.reset_for_trial(identity, self.skill, sample)
             if not isinstance(setup, Gate0Setup):
                 setup = Gate0Setup.model_validate(setup)
             resolved_identity = identity.model_copy(update={"reset_id": setup.reset_id})
+            cohort_id = _matched_cohort_id(
+                resolved_identity,
+                skill=self.skill,
+                source_revision=self.run_identity.source_revision,
+            )
+            phase = "setup_persistence"
             self.setup_sink.append_setup(setup.record)
+            phase = "staging"
             desired_position = sample_world_position(
                 sample,
                 target_position_m=setup.target_position_m,
                 approach_axis_world=self.config.sampler.approach_axis_world,
             )
             desired = CandidateGeometry(
-                candidate_id=sample.sample_id,
+                candidate_id=sample.candidate_id,
                 kind="perturbation",
                 eef_position_m=desired_position,
                 target_relative_position_m=tuple(
@@ -285,12 +358,31 @@ class Gate0Collector:
             )
             while True:
                 current = self.adapter.current_eef_position_m()
-                error = float(
+                quaternion = self.adapter.current_eef_quaternion_xyzw()
+                current_yaw, current_pitch = wrist_yaw_pitch(quaternion)
+                position_error = float(
                     np.linalg.norm(
                         np.asarray(desired_position) - np.asarray(current)
                     )
                 )
-                if error <= self.config.staging_tolerance_m:
+                yaw_error = abs(
+                    math.atan2(
+                        math.sin(sample.wrist_yaw_rad - current_yaw),
+                        math.cos(sample.wrist_yaw_rad - current_yaw),
+                    )
+                )
+                pitch_error = abs(
+                    math.atan2(
+                        math.sin(sample.wrist_pitch_rad - current_pitch),
+                        math.cos(sample.wrist_pitch_rad - current_pitch),
+                    )
+                )
+                if (
+                    position_error <= self.config.staging_tolerance_m
+                    and yaw_error <= self.config.staging_orientation_tolerance_rad
+                    and pitch_error
+                    <= self.config.staging_orientation_tolerance_rad
+                ):
                     break
                 if (
                     staging_steps >= self.config.max_staging_steps
@@ -298,7 +390,11 @@ class Gate0Collector:
                     or time.monotonic() - started >= self.config.max_staging_time_s
                 ):
                     raise RuntimeError(
-                        "requested Gate-0 candidate was not reached within staging budget"
+                        "requested Gate-0 candidate was not reached within staging "
+                        "budget: "
+                        f"position_error_m={position_error:.6g}, "
+                        f"yaw_error_rad={yaw_error:.6g}, "
+                        f"pitch_error_rad={pitch_error:.6g}"
                     )
                 stage = self.adapter.stage(desired, self.config.staging_step_m)
                 staging_steps += stage.steps
@@ -318,6 +414,14 @@ class Gate0Collector:
                 reason = TerminationReason.CANCELLED
                 mode = FailureMode.CANCELLATION
                 state = GovernorState.CANCELLED
+            elif _is_timeout_failure(exc):
+                reason = TerminationReason.TIMEOUT
+                mode = FailureMode.TIMEOUT
+                state = GovernorState.ABORT
+            elif _is_rpc_failure(exc):
+                reason = TerminationReason.RPC_FAILURE
+                mode = FailureMode.RPC
+                state = GovernorState.ABORT
             elif status.terminated:
                 reason = TerminationReason.EPISODE_TERMINATED_BEFORE_VLA
                 mode = FailureMode.TERMINATION_BEFORE_VLA
@@ -326,14 +430,21 @@ class Gate0Collector:
                 reason = TerminationReason.EPISODE_TRUNCATED_BEFORE_VLA
                 mode = FailureMode.TRUNCATION
                 state = GovernorState.TRUNCATED
-            elif setup is not None:
+            elif phase == "staging":
                 reason = TerminationReason.STAGING_FAILURE
                 mode = FailureMode.STAGING
                 state = GovernorState.STAGING_FAILURE
             else:
-                reason = TerminationReason.PERCEPTION_FAILURE
-                mode = FailureMode.PERCEPTION
-                state = GovernorState.PERCEPTION_FAILURE
+                # Reset/setup extraction and durable setup persistence occur
+                # before deployment perception. Collapsing those failures into
+                # "perception" would corrupt the failure analysis.
+                reason = TerminationReason.INVALID_STATE
+                mode = (
+                    FailureMode.INVALID_INPUT
+                    if phase == "reset_or_setup"
+                    else FailureMode.UNKNOWN
+                )
+                state = GovernorState.ABORT
             outcome = _failure_outcome(
                 identity=resolved_identity,
                 skill=self.skill,
@@ -349,6 +460,7 @@ class Gate0Collector:
                 staging_distance_m=staging_distance,
                 staging_time_s=staging_time,
                 source_revision=self.run_identity.source_revision,
+                metadata=self._execution_metadata(sample, cohort_id=cohort_id),
             )
             self.outcome_sink.append_outcome(outcome)
             return outcome
@@ -383,6 +495,8 @@ class Gate0Collector:
                 "source_revision": self.run_identity.source_revision,
                 "execution_layer": "gate0",
                 "requested_sample_id": sample.sample_id,
+                "candidate_id": sample.candidate_id,
+                **self._execution_metadata(sample, cohort_id=cohort_id),
             },
             initial_costs=CostRecord(
                 analytic_steps=staging_steps,
@@ -392,3 +506,22 @@ class Gate0Collector:
         )
         result: GovernorRunResult = direct_governor.run(self.adapter, invocation)
         return result.outcome
+
+    def _execution_metadata(
+        self,
+        sample: Gate0Sample,
+        *,
+        cohort_id: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "gate0_configuration_id": self.run_identity.configuration_id,
+            "execution_plan_id": self.run_identity.execution_plan_id,
+            "runtime_attestation_id": self.run_identity.runtime_attestation_id,
+            "runtime_attestation_sha256": (
+                self.run_identity.runtime_attestation_sha256
+            ),
+            "gate0_matched_cohort_id": cohort_id,
+            "gate0_candidate_id": sample.candidate_id,
+            "gate0_repeat_index": sample.repeat_index,
+            "requested_sample_id": sample.sample_id,
+        }

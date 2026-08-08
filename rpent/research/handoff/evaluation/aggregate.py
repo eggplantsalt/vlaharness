@@ -37,7 +37,7 @@ class AggregateGroup(HandoffRecord):
     n_records: int = Field(gt=0)
     controller_metrics: dict[str, MetricValue]
     system_metrics: dict[str, MetricValue]
-    task_success_interval: BootstrapInterval
+    target_success_interval: BootstrapInterval
     predictive_metrics: BinaryEvaluation | None = None
     predictive_unavailable_reason: str | None = None
     handoff_regret: MetricValue
@@ -231,6 +231,9 @@ def outcome_to_tidy_row(record: OutcomeRecord) -> dict[str, Any]:
         "llm_turns": record.costs.llm_turns,
         "input_tokens": record.costs.input_tokens,
         "output_tokens": record.costs.output_tokens,
+        "system_analytic_time_s": record.costs.system_analytic_time_s,
+        "intervention_count": record.costs.intervention_count,
+        "recovery_retry_cost": record.costs.recovery_retry_cost,
         "eef_x_m": state.eef_position_m[0] if state is not None else None,
         "eef_y_m": state.eef_position_m[1] if state is not None else None,
         "eef_z_m": state.eef_position_m[2] if state is not None else None,
@@ -254,6 +257,7 @@ def outcome_to_tidy_row(record: OutcomeRecord) -> dict[str, Any]:
         "oracle_cost": _finite_metadata_number(record, "oracle_cost"),
         "representation": record.metadata.get("representation"),
         "evidence_mode": record.metadata.get("evidence_mode"),
+        "decision_mode": record.metadata.get("decision_mode"),
         "uncertainty_mode": record.metadata.get("uncertainty_mode"),
         "hierarchy_mode": record.metadata.get("hierarchy_mode"),
         "data_status": _data_status(record),
@@ -283,6 +287,27 @@ def _predictive_metrics(
 ) -> tuple[BinaryEvaluation | None, str | None]:
     if target_label is None:
         return None, "target label was not explicitly selected"
+    predictive_identities = {
+        (
+            str(
+                record.metadata.get(
+                    "condition", record.metadata.get("condition_name")
+                )
+            ),
+            record.controller.configuration_id,
+            str(record.controller.checkpoint_id),
+            record.skill.name,
+            target_label,
+        )
+        for record in records
+        if _selected_estimate(record) is not None
+    }
+    if len(predictive_identities) > 1:
+        return None, (
+            "predictive/calibration metrics refuse pooled condition, controller, "
+            "checkpoint, skill, or target identities; aggregate one predictive "
+            "identity at a time"
+        )
     labels: list[bool] = []
     probabilities: list[float] = []
     uncertainties: list[float] = []
@@ -312,13 +337,15 @@ def _predictive_metrics(
 def _success_interval(
     records: Sequence[OutcomeRecord],
     *,
+    target_label: str | None,
     iterations: int,
     seed: int,
 ) -> BootstrapInterval:
     values: list[bool] = []
     groups: list[str] = []
+    selected_label = target_label or "task_success"
     for record in records:
-        value = record.labels.task_success.value
+        value = record.labels.target_value(selected_label)
         if value is None:
             continue
         values.append(value)
@@ -363,10 +390,14 @@ def _aggregate_group(
     return AggregateGroup(
         group=group,
         n_records=len(records),
-        controller_metrics=evaluate_controller_records(records),
-        system_metrics=evaluate_system_records(records),
-        task_success_interval=_success_interval(
+        controller_metrics=evaluate_controller_records(
             records,
+            target_label=target_label,
+        ),
+        system_metrics=evaluate_system_records(records),
+        target_success_interval=_success_interval(
+            records,
+            target_label=target_label,
             iterations=bootstrap_iterations,
             seed=bootstrap_seed,
         ),
@@ -421,6 +452,61 @@ def _group_records(
     return result
 
 
+def _verify_controlled_reset_pairing(records: Sequence[OutcomeRecord]) -> None:
+    """Fail closed unless each policy sees the same realized reset per context."""
+    conditions = {
+        str(
+            record.metadata.get(
+                "condition", record.metadata.get("condition_name")
+            )
+        )
+        for record in records
+    }
+    if len(conditions) <= 1:
+        return
+    paired: dict[
+        tuple[str, str, int, int],
+        dict[str, list[OutcomeRecord]],
+    ] = defaultdict(lambda: defaultdict(list))
+    for record in records:
+        context = (
+            record.identity.suite,
+            str(record.identity.task_id),
+            record.identity.seed,
+            record.identity.repeat_index,
+        )
+        condition = str(
+            record.metadata.get(
+                "condition", record.metadata.get("condition_name")
+            )
+        )
+        paired[context][condition].append(record)
+    violations: dict[str, Any] = {}
+    for context, by_condition in paired.items():
+        counts = {name: len(values) for name, values in by_condition.items()}
+        reset_ids = {
+            record.identity.reset_id
+            for values in by_condition.values()
+            for record in values
+        }
+        if (
+            set(by_condition) != conditions
+            or any(count != 1 for count in counts.values())
+            or None in reset_ids
+            or len(reset_ids) != 1
+        ):
+            violations["|".join(map(str, context))] = {
+                "expected_conditions": sorted(conditions),
+                "observed_counts": dict(sorted(counts.items())),
+                "reset_ids": sorted(str(value) for value in reset_ids),
+            }
+    if violations:
+        raise ValueError(
+            "controlled comparison is not a complete matched-reset policy panel: "
+            + json.dumps(violations, sort_keys=True)
+        )
+
+
 def aggregate_outcomes(
     records: Sequence[OutcomeRecord],
     *,
@@ -448,6 +534,8 @@ def aggregate_outcomes(
             "aggregation refuses mixed execution layers or record scopes; "
             f"layers={sorted(layers)}, scopes={sorted(scopes)}"
         )
+    if layers == {"controlled"}:
+        _verify_controlled_reset_pairing(records)
     protocol_violations = [
         record.record_id
         for record in records
@@ -479,7 +567,7 @@ def aggregate_outcomes(
         data_status_counts=dict(sorted(statuses.items())),
         overall=_aggregate_group(
             records,
-            {"scope": "overall"},
+            {"scope": "pooled_inventory_not_method_comparison"},
             target_label=target_label,
             bootstrap_iterations=bootstrap_iterations,
             bootstrap_seed=bootstrap_seed,
@@ -493,7 +581,14 @@ def aggregate_outcomes(
                 "configuration_id",
             )
         ),
-        per_task=aggregate_many(("suite", "task")),
+        per_task=aggregate_many(
+            (
+                "execution_layer",
+                "record_scope",
+                "suite",
+                "task",
+            )
+        ),
         per_method_task=aggregate_many(
             (
                 "execution_layer",
@@ -560,10 +655,10 @@ def _aggregate_group_row(group: AggregateGroup) -> dict[str, Any]:
             row[f"{prefix}.{name}.reason"] = metric.reason
     row.update(
         {
-            "task_success_ci.estimate": group.task_success_interval.estimate,
-            "task_success_ci.lower": group.task_success_interval.lower,
-            "task_success_ci.upper": group.task_success_interval.upper,
-            "task_success_ci.n_groups": group.task_success_interval.n_groups,
+            "target_success_ci.estimate": group.target_success_interval.estimate,
+            "target_success_ci.lower": group.target_success_interval.lower,
+            "target_success_ci.upper": group.target_success_interval.upper,
+            "target_success_ci.n_groups": group.target_success_interval.n_groups,
             "handoff_regret": group.handoff_regret.value,
             "handoff_regret.reason": group.handoff_regret.reason,
         }

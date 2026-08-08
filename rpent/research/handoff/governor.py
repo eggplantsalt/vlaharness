@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from dataclasses import dataclass, field
@@ -32,6 +31,7 @@ from rpent.research.handoff.types import (
     TerminationRecord,
     TimingRecord,
     TrialIdentity,
+    outcome_record_id,
     unavailable_signal,
 )
 
@@ -177,20 +177,39 @@ class InMemoryResearchSink:
         self.outcomes.append(outcome)
 
 
-def _record_id(identity: TrialIdentity, reason: TerminationReason) -> str:
-    canonical = json.dumps(
-        [identity.model_dump(mode="json"), reason.value],
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return "outcome-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
-
-
 def _is_cancellation(exc: BaseException) -> bool:
     return isinstance(exc, GovernorCancelled) or exc.__class__.__name__ in {
         "ToolCancelled",
         "CancelledError",
     }
+
+
+def _exception_chain(exc: BaseException) -> tuple[BaseException, ...]:
+    result: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        result.append(current)
+        current = current.__cause__ or current.__context__
+    return tuple(result)
+
+
+def _classify_vla_failure(value: BaseException | str) -> tuple[TerminationReason, FailureMode]:
+    if isinstance(value, BaseException):
+        chain = _exception_chain(value)
+        text = " ".join(
+            f"{item.__class__.__name__} {item}".lower() for item in chain
+        )
+        timeout = any(isinstance(item, TimeoutError) for item in chain)
+    else:
+        text = value.lower()
+        timeout = False
+    if timeout or "timeout" in text or "timed out" in text:
+        return TerminationReason.TIMEOUT, FailureMode.TIMEOUT
+    if any(token in text for token in ("rpc", "transport", "connection", "socket")):
+        return TerminationReason.RPC_FAILURE, FailureMode.RPC
+    return TerminationReason.VLA_FAILURE, FailureMode.VLA
 
 
 def _status_labels(status: EpisodeStatus) -> OutcomeLabels:
@@ -247,9 +266,19 @@ class HandoffGovernor:
         transitions: list[GovernorTransition] = []
         decisions: list[HandoffDecision] = []
         last_state: HandoffState | None = None
-        analytic_steps = invocation.initial_costs.analytic_steps
-        analytic_distance = invocation.initial_costs.analytic_distance_m
-        analytic_time = invocation.initial_costs.analytic_time_s
+        initial_analytic = (
+            invocation.initial_costs.analytic_steps,
+            invocation.initial_costs.analytic_distance_m,
+            invocation.initial_costs.analytic_time_s,
+        )
+        if any(value is None for value in initial_analytic):
+            raise ValueError(
+                "online governor requires observed initial analytic costs; "
+                "null is reserved for post-run incomplete-attempt summaries"
+            )
+        analytic_steps = int(initial_analytic[0])
+        analytic_distance = float(initial_analytic[1])
+        analytic_time = float(initial_analytic[2])
         observe_time = 0.0
         decide_time = 0.0
         active_policy = self.policy
@@ -288,15 +317,27 @@ class HandoffGovernor:
         ) -> GovernorRunResult:
             transition(GovernorState.RECORD_OUTCOME, "persist final governor outcome")
             ended = self._monotonic()
-            vla_invocations = vla_result.invocations if vla_result is not None else 0
-            vla_elapsed = vla_result.elapsed_s if vla_result is not None else 0.0
+            vla_invocations = (
+                vla_result.invocations
+                if vla_result is not None
+                else (1 if handoff_started else 0)
+            )
+            vla_elapsed = (
+                vla_result.elapsed_s
+                if vla_result is not None
+                else (
+                    max(0.0, ended - vla_started_s)
+                    if vla_started_s is not None
+                    else 0.0
+                )
+            )
             vla_chunks = vla_result.chunks if vla_result is not None else None
             vla_actions = vla_result.env_actions if vla_result is not None else None
             total_actions = (
                 analytic_steps + vla_actions if vla_actions is not None else None
             )
             outcome = OutcomeRecord(
-                record_id=_record_id(invocation.identity, reason),
+                record_id=outcome_record_id(invocation.identity),
                 identity=invocation.identity,
                 skill=invocation.skill,
                 controller=invocation.controller,
@@ -314,6 +355,17 @@ class HandoffGovernor:
                     vla_time_s=vla_elapsed,
                     total_env_actions=total_actions,
                     total_elapsed_s=max(0.0, ended - started),
+                    system_analytic_time_s=invocation.initial_costs.system_analytic_time_s,
+                    intervention_count=(
+                        invocation.initial_costs.intervention_count
+                        if invocation.initial_costs.intervention_count is not None
+                        else 0
+                    ),
+                    recovery_retry_cost=(
+                        invocation.initial_costs.recovery_retry_cost
+                        if invocation.initial_costs.recovery_retry_cost is not None
+                        else 0.0
+                    ),
                 ),
                 timing=TimingRecord(
                     started_monotonic_s=started,
@@ -420,13 +472,10 @@ class HandoffGovernor:
                 if _is_cancellation(exc):
                     raise
                 status = current_status()
+                failure_reason, failure_mode = _classify_vla_failure(exc)
                 return finalize(
-                    reason=TerminationReason.VLA_FAILURE,
-                    failure_mode=(
-                        FailureMode.RPC
-                        if "rpc" in exc.__class__.__name__.lower()
-                        else FailureMode.VLA
-                    ),
+                    reason=failure_reason,
+                    failure_mode=failure_mode,
                     final_state=GovernorState.VLA_FAILURE,
                     handoff_occurred=True,
                     labels=_status_labels(status),
@@ -435,13 +484,12 @@ class HandoffGovernor:
                 )
             status = current_status()
             if vla_result.exception:
+                failure_reason, failure_mode = _classify_vla_failure(
+                    vla_result.exception
+                )
                 return finalize(
-                    reason=TerminationReason.VLA_FAILURE,
-                    failure_mode=(
-                        FailureMode.RPC
-                        if "rpc" in vla_result.exception.lower()
-                        else FailureMode.VLA
-                    ),
+                    reason=failure_reason,
+                    failure_mode=failure_mode,
                     final_state=GovernorState.VLA_FAILURE,
                     handoff_occurred=True,
                     labels=_status_labels(status),
@@ -456,6 +504,16 @@ class HandoffGovernor:
                     raise
                 labels = _status_labels(status)
                 message = f"outcome labeler failed: {exc}"
+                return finalize(
+                    reason=TerminationReason.OUTCOME_LABEL_FAILURE,
+                    failure_mode=FailureMode.OUTCOME_LABEL,
+                    final_state=GovernorState.OUTCOME_LABEL_FAILURE,
+                    handoff_occurred=True,
+                    labels=labels,
+                    status=status,
+                    message=message,
+                    planner_result=vla_result.result,
+                )
             else:
                 message = None
             return finalize(

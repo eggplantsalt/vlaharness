@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -112,6 +114,9 @@ def test_training_split_calibration_target_and_artifact_compatibility(tmp_path: 
     assert result.report.target_label == "primitive_success"
     assert result.report.train.successes == result.report.train.failures
     artifact_dir = tmp_path / "model"
+    runtime_identity = tmp_path / "runtime-probe.json"
+    runtime_identity.write_text('{"fixture":true}\n', encoding="utf-8")
+    runtime_identity_sha256 = hashlib.sha256(runtime_identity.read_bytes()).hexdigest()
     manifest = save_model_artifact(
         artifact_dir,
         model=result.model,
@@ -119,7 +124,12 @@ def test_training_split_calibration_target_and_artifact_compatibility(tmp_path: 
         training_target_label="primitive_success",
         dataset_fingerprint=dataset.fingerprint,
         training_configuration=config.model_dump(mode="json"),
-        source_identity=SourceIdentity(git_revision="test"),
+        source_identity=SourceIdentity(
+            git_revision="test",
+            source_revision="git:test;worktree-sha256:fixture",
+            external_runtime_identity=str(runtime_identity.resolve()),
+            external_runtime_identity_sha256=runtime_identity_sha256,
+        ),
         calibration_method=config.calibration_method,
         split_assignment_fingerprint=result.assignment.fingerprint,
         training_record_ids=tuple(
@@ -140,6 +150,13 @@ def test_training_split_calibration_target_and_artifact_compatibility(tmp_path: 
     )
     assert loaded.feature_spec_id == spec.spec_id
     assert loaded_manifest == manifest
+    assert loaded_manifest.source_identity.source_revision == (
+        "git:test;worktree-sha256:fixture"
+    )
+    assert (
+        loaded_manifest.source_identity.external_runtime_identity_sha256
+        == runtime_identity_sha256
+    )
     incompatible = make_feature_spec(
         FeaturePreset.TARGET_RELATIVE, skill_vocabulary=("pick",)
     )
@@ -149,3 +166,18 @@ def test_training_split_calibration_target_and_artifact_compatibility(tmp_path: 
             trusted=True,
             expected_feature_spec=incompatible,
         )
+
+    manifest_path = artifact_dir / "manifest.json"
+    mutated = json.loads(manifest_path.read_text(encoding="utf-8"))
+    mutated["calibration_method"] = "mutated-after-id"
+    manifest_path.write_text(json.dumps(mutated) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="identity mismatch"):
+        load_model_artifact(artifact_dir, trusted=True)
+
+
+def test_source_identity_requires_runtime_path_and_checksum_together() -> None:
+    with pytest.raises(ValueError, match="jointly present"):
+        SourceIdentity(external_runtime_identity="probe.json")
+
+    with pytest.raises(ValueError, match="jointly present"):
+        SourceIdentity(external_runtime_identity_sha256="0" * 64)

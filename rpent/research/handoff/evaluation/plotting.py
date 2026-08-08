@@ -80,7 +80,10 @@ def plot_calibration_curve(
     _require_observed_aggregation(result)
     predictive = result.overall.predictive_metrics
     if predictive is None or not predictive.calibration.bins:
-        raise ValueError("aggregation has no calibration data to plot")
+        raise ValueError(
+            "aggregation has no single-identity calibration data to plot; "
+            "aggregate one condition/controller/checkpoint/skill/target at a time"
+        )
     plt = _pyplot()
     figure, axis = plt.subplots(figsize=(5.2, 4.6))
     bins = predictive.calibration.bins
@@ -103,25 +106,46 @@ def plot_method_success_cost(
     result: AggregationResult,
     output_path: str | os.PathLike[str],
 ) -> Path:
-    """Plot method task-success with mean analytic+VLA time as the cost axis."""
+    """Plot the explicitly selected outcome target against observed time cost."""
     _require_observed_aggregation(result)
+    metric_by_target = {
+        "primitive_success": "primitive_success_rate",
+        "skill_success": "skill_success_rate",
+        "task_success": "task_success_rate",
+    }
+    metric_name = metric_by_target.get(str(result.target_label))
+    if metric_name is None:
+        raise ValueError(
+            "success-cost plotting requires target_label to be one of "
+            "primitive_success, skill_success, or task_success"
+        )
     rows = []
     for group in result.per_method:
         method = str(group.group["method"])
-        success = group.controller_metrics["task_success_rate"].value
-        analytic_time = group.controller_metrics["mean_analytic_time_s"].value
+        condition = str(group.group.get("condition", "unlabeled"))
+        configuration = str(group.group.get("configuration_id", "unknown"))
+        label = f"{condition} | {method} | {configuration[:10]}"
+        success = group.controller_metrics[metric_name].value
+        if group.group.get("execution_layer") == "full_agent":
+            analytic_time = group.system_metrics["analytic_time_s"].value
+        else:
+            analytic_time = group.controller_metrics["mean_analytic_time_s"].value
         vla_time = group.controller_metrics["mean_vla_time_s"].value
         if success is None or analytic_time is None or vla_time is None:
             continue
-        rows.append((method, analytic_time + vla_time, success))
+        rows.append((label, analytic_time + vla_time, success))
     if not rows:
         raise ValueError("no method has jointly available success and cost")
     plt = _pyplot()
     figure, axis = plt.subplots(figsize=(6.2, 4.8))
-    for method, cost, success in rows:
+    for label, cost, success in rows:
         axis.scatter([cost], [success], s=48)
-        axis.annotate(method, (cost, success), xytext=(4, 4), textcoords="offset points")
-    axis.set(xlabel="Mean analytic + VLA time (s)", ylabel="Task success", ylim=(0, 1))
+        axis.annotate(label, (cost, success), xytext=(4, 4), textcoords="offset points")
+    axis.set(
+        xlabel="Mean analytic + VLA time (s)",
+        ylabel=f"{result.target_label} rate",
+        ylim=(0, 1),
+    )
     try:
         return _save_figure(figure, output_path)
     finally:
@@ -135,7 +159,12 @@ def plot_handoff_regret(
     """Plot mean matched-candidate regret for methods with oracle metadata."""
     _require_observed_aggregation(result)
     rows = [
-        (str(group.group["method"]), group.handoff_regret.value)
+        (
+            f"{group.group.get('condition', 'unlabeled')} | "
+            f"{group.group['method']} | "
+            f"{str(group.group.get('configuration_id', 'unknown'))[:10]}",
+            group.handoff_regret.value,
+        )
         for group in result.per_method
         if group.handoff_regret.value is not None
     ]
@@ -203,6 +232,27 @@ def plot_ablation(
 ) -> Path:
     """Plot observed mean metric by representation/uncertainty/evidence factor."""
     observed = _observed_rows(rows)
+    confounders = (
+        "execution_layer",
+        "record_scope",
+        "method",
+        "representation",
+        "evidence_mode",
+        "decision_mode",
+        "uncertainty_mode",
+        "hierarchy_mode",
+    )
+    mixed = {
+        key: sorted({str(row.get(key)) for row in observed})
+        for key in confounders
+        if key != factor_key
+        and len({str(row.get(key)) for row in observed}) > 1
+    }
+    if mixed:
+        raise ValueError(
+            "ablation input mixes uncontrolled factors; filter rows first: "
+            f"{mixed}"
+        )
     grouped: dict[str, list[float]] = {}
     for row in observed:
         factor = row.get(factor_key)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -11,9 +12,19 @@ from rpent.research.handoff.evaluation.aggregate import (
 )
 from rpent.research.handoff.evaluation.metrics import (
     evaluate_binary_predictions,
+    evaluate_controller_records,
+    evaluate_system_records,
     handoff_regret,
 )
-from rpent.research.handoff.evaluation.plotting import plot_gate0_landscape
+from rpent.research.handoff.evaluation.oracle import (
+    OracleCostConfig,
+    annotate_matched_oracle_costs,
+)
+from rpent.research.handoff.evaluation import plotting
+from rpent.research.handoff.evaluation.plotting import (
+    plot_gate0_landscape,
+    plot_method_success_cost,
+)
 from rpent.research.handoff.evaluation.statistics import grouped_bootstrap_interval
 from rpent.research.handoff.types import (
     ControllerIdentity,
@@ -193,6 +204,210 @@ def test_outcome_aggregation_writes_real_csv_and_json(tmp_path) -> None:
     assert artifacts.calibration_csv is None
 
 
+def test_aggregation_refuses_cross_layer_or_cross_scope_pooling() -> None:
+    controlled = _record(0, success=True).model_copy(
+        update={"metadata": {"execution_layer": "controlled"}}
+    )
+    full_agent = _record(1, success=False).model_copy(
+        update={
+            "metadata": {
+                "execution_layer": "full_agent",
+                "record_scope": "full_agent_episode",
+            }
+        }
+    )
+
+    with pytest.raises(ValueError, match="mixed execution layers or record scopes"):
+        aggregate_outcomes(
+            (controlled, full_agent),
+            target_label="skill_success",
+            bootstrap_iterations=10,
+        )
+
+
+def _controlled_record(
+    index: int,
+    *,
+    condition: str,
+    reset_id: str,
+) -> OutcomeRecord:
+    source = _record(index, success=index % 2 == 0)
+    return source.model_copy(
+        update={
+            "identity": source.identity.model_copy(
+                update={
+                    "seed": 0,
+                    "reset_id": reset_id,
+                    "repeat_index": 0,
+                }
+            ),
+            "controller": source.controller.model_copy(
+                update={
+                    "method": f"method-{condition}",
+                    "configuration_id": f"config-{condition}",
+                }
+            ),
+            "metadata": {
+                **source.metadata,
+                "condition": condition,
+                "execution_layer": "controlled",
+                "record_scope": "handoff_invocation",
+                "protocol_adherent": True,
+            },
+        }
+    )
+
+
+def test_controlled_aggregation_requires_complete_matched_reset_panel() -> None:
+    first = _controlled_record(0, condition="direct", reset_id="shared-reset")
+    second = _controlled_record(1, condition="ours", reset_id="shared-reset")
+
+    result = aggregate_outcomes(
+        (first, second),
+        target_label="skill_success",
+        bootstrap_iterations=10,
+    )
+
+    assert result.n_records == 2
+    assert {group.group["condition"] for group in result.per_method} == {
+        "direct",
+        "ours",
+    }
+
+    mismatched = second.model_copy(
+        update={
+            "identity": second.identity.model_copy(
+                update={"reset_id": "different-reset"}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="complete matched-reset policy panel"):
+        aggregate_outcomes(
+            (first, mismatched),
+            target_label="skill_success",
+            bootstrap_iterations=10,
+        )
+
+
+def test_controller_metrics_use_explicit_target_and_schema_cost_fields() -> None:
+    source = _record(0, success=True)
+    labels = source.labels.model_copy(
+        update={
+            "skill_success": source.labels.skill_success.model_copy(
+                update={"value": False}
+            )
+        }
+    )
+    record = source.model_copy(
+        update={
+            "labels": labels,
+            "costs": source.costs.model_copy(
+                update={
+                    "intervention_count": 0,
+                    "system_analytic_time_s": 0.75,
+                    "recovery_retry_cost": 2.0,
+                }
+            ),
+        }
+    )
+
+    skill = evaluate_controller_records((record,), target_label="skill_success")
+    primitive = evaluate_controller_records(
+        (record,), target_label="primitive_success"
+    )
+    system = evaluate_system_records((record,))
+
+    assert skill["vla_success_per_handoff"].value == 0.0
+    assert skill["failed_vla_calls_per_success"].value is None
+    assert primitive["vla_success_per_handoff"].value == 1.0
+    assert primitive["failed_vla_calls_per_success"].value == 0.0
+    assert skill["intervention_count"].value == 0.0
+    assert system["analytic_time_s"].value == pytest.approx(0.75)
+    assert system["recovery_retry_cost"].value == pytest.approx(2.0)
+
+
+def test_cost_record_new_fields_are_optional_for_legacy_json() -> None:
+    legacy = CostRecord.model_validate(
+        {
+            "analytic_steps": 1,
+            "analytic_distance_m": 0.1,
+            "analytic_time_s": 0.2,
+            "vla_invocations": 1,
+            "vla_time_s": 0.3,
+            "total_elapsed_s": 0.5,
+        }
+    )
+
+    assert legacy.system_analytic_time_s is None
+    assert legacy.intervention_count is None
+    assert legacy.recovery_retry_cost is None
+    assert CostRecord.model_validate_json(legacy.canonical_json()) == legacy
+
+
+def test_success_cost_plot_uses_selected_target_not_task_success(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    source = _record(0, success=True)
+    record = source.model_copy(
+        update={
+            "labels": source.labels.model_copy(
+                update={
+                    "skill_success": source.labels.skill_success.model_copy(
+                        update={"value": False}
+                    ),
+                    "task_success": source.labels.task_success.model_copy(
+                        update={"value": True}
+                    ),
+                }
+            )
+        }
+    )
+    result = aggregate_outcomes(
+        (record,),
+        target_label="skill_success",
+        bootstrap_iterations=10,
+    )
+
+    class FakeFigure:
+        def savefig(self, path, **_kwargs):
+            Path(path).write_bytes(b"fixture plot")
+
+    class FakeAxis:
+        def __init__(self):
+            self.points = []
+            self.settings = {}
+
+        def scatter(self, x, y, **_kwargs):
+            self.points.append((tuple(x), tuple(y)))
+
+        def annotate(self, *_args, **_kwargs):
+            return None
+
+        def set(self, **kwargs):
+            self.settings.update(kwargs)
+
+    axis = FakeAxis()
+
+    class FakePyplot:
+        @staticmethod
+        def subplots(**_kwargs):
+            return FakeFigure(), axis
+
+        @staticmethod
+        def close(_figure):
+            return None
+
+    monkeypatch.setattr(plotting, "_pyplot", lambda: FakePyplot())
+    output = plot_method_success_cost(result, tmp_path / "success-cost.png")
+
+    assert output.is_file()
+    assert len(axis.points) == 1
+    assert axis.points[0][0][0] == pytest.approx(0.3)
+    assert axis.points[0][1] == (0.0,)
+    assert axis.settings["ylabel"] == "skill_success rate"
+
+
 def test_plotting_refuses_empty_and_synthetic_inputs(tmp_path) -> None:
     with pytest.raises(ValueError, match="empty"):
         plot_gate0_landscape([], tmp_path / "empty.png")
@@ -208,3 +423,116 @@ def test_plotting_refuses_empty_and_synthetic_inputs(tmp_path) -> None:
             ],
             tmp_path / "fake.png",
         )
+
+
+def test_posthoc_oracle_uses_only_unique_candidates_in_exact_matched_context() -> None:
+    first = _record(0, success=True).model_copy(
+        update={
+            "metadata": {
+                "data_status": "observed",
+                "execution_layer": "gate0",
+                "record_scope": "handoff_invocation",
+            }
+        }
+    )
+    second_source = _record(1, success=False)
+    second = second_source.model_copy(
+        update={
+            "identity": second_source.identity.model_copy(
+                update={
+                    "run_id": first.identity.run_id,
+                    "suite": first.identity.suite,
+                    "task_id": first.identity.task_id,
+                    "seed": first.identity.seed,
+                    "reset_id": first.identity.reset_id,
+                    "repeat_index": first.identity.repeat_index,
+                    "candidate_id": "candidate-alternative",
+                }
+            ),
+            "controller": first.controller,
+            "skill": first.skill,
+            "metadata": {
+                "data_status": "observed",
+                "execution_layer": "gate0",
+                "record_scope": "handoff_invocation",
+            },
+        }
+    )
+    config = OracleCostConfig(
+        target_label="skill_success",
+        failure_penalty=100.0,
+        analytic_distance_weight=1.0,
+    )
+    policy_source = _record(2, success=False)
+    policy = policy_source.model_copy(
+        update={
+            "identity": policy_source.identity.model_copy(
+                update={
+                    "suite": first.identity.suite,
+                    "task_id": first.identity.task_id,
+                    "seed": first.identity.seed,
+                    "reset_id": first.identity.reset_id,
+                    "repeat_index": first.identity.repeat_index,
+                }
+            ),
+            "skill": first.skill,
+            "controller": policy_source.controller.model_copy(
+                update={"checkpoint_id": first.controller.checkpoint_id}
+            ),
+            "metadata": {
+                "data_status": "observed",
+                "condition": "controlled-policy",
+                "execution_layer": "controlled",
+                "record_scope": "handoff_invocation",
+            },
+        }
+    )
+
+    annotated = annotate_matched_oracle_costs(
+        (first, second),
+        config,
+        policy_records=(policy,),
+    )
+
+    assert annotated.matched_groups == 1
+    assert annotated.annotated_records == 2
+    assert annotated.annotated_policy_records == 1
+    assert annotated.records[0].metadata["oracle_cost"] == 0.0
+    assert annotated.records[1].metadata["chosen_cost"] > 100.0
+    assert all(
+        record.metadata["oracle_is_posthoc"] is True
+        and record.metadata["oracle_policy_eligible"] is False
+        for record in annotated.records
+    )
+    annotated_policy = annotated.policy_records[0]
+    policy_regret = handoff_regret(
+        [annotated_policy.metadata["chosen_cost"]],
+        [annotated_policy.metadata["oracle_cost"]],
+    )
+    assert policy_regret.mean_regret.value is not None
+    assert policy_regret.mean_regret.value > 100.0
+    assert annotated_policy.metadata["oracle_candidate_set_source"] == (
+        "matched_gate0_landscape"
+    )
+
+    duplicate_candidate = second.model_copy(
+        update={
+            "identity": second.identity.model_copy(
+                update={"candidate_id": first.identity.candidate_id}
+            )
+        }
+    )
+    with pytest.raises(ValueError, match="duplicate candidate"):
+        annotate_matched_oracle_costs((first, duplicate_candidate), config)
+
+    wrong_cohort = second.model_copy(
+        update={
+            "metadata": {
+                **second.metadata,
+                "gate0_matched_cohort_id": "gate0-cohort-wrong",
+                "gate0_candidate_id": second.identity.candidate_id,
+            }
+        }
+    )
+    with pytest.raises(ValueError, match="declared matched cohort"):
+        annotate_matched_oracle_costs((first, wrong_cohort), config)

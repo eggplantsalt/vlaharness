@@ -424,6 +424,26 @@ def _numeric_summary(
     return _metric(name, value, len(available), unit=unit)
 
 
+def _numeric_total(
+    name: str,
+    values: Iterable[int | float | None],
+    *,
+    unit: str,
+) -> MetricValue:
+    materialized = list(values)
+    available = [float(value) for value in materialized if value is not None]
+    if not materialized or len(available) != len(materialized):
+        return unavailable_metric(
+            name,
+            "authoritative telemetry is unavailable for one or more records",
+            n=len(available),
+            unit=unit,
+        )
+    if any(not math.isfinite(value) for value in available):
+        raise ValueError(f"non-finite telemetry for {name}")
+    return _metric(name, sum(available), len(available), unit=unit)
+
+
 def _ratio_metric(
     name: str,
     numerator: int,
@@ -444,20 +464,51 @@ def _ratio_metric(
 
 def evaluate_controller_records(
     records: Sequence[OutcomeRecord],
+    *,
+    target_label: str | None = None,
 ) -> dict[str, MetricValue]:
     """Aggregate controller-level outcomes without collapsing label semantics."""
     handoff_records = [record for record in records if record.handoff_occurred]
-    vla_failures = sum(
-        record.termination.failure_mode is FailureMode.VLA
-        for record in handoff_records
+    target_values = (
+        [record.labels.target_value(target_label) for record in handoff_records]
+        if target_label is not None
+        else []
     )
-    rpc_failures = sum(
-        record.termination.failure_mode is FailureMode.RPC
-        for record in handoff_records
-    )
-    vla_successes = sum(
-        record.labels.skill_success.value is True for record in handoff_records
-    )
+    if target_label is None:
+        vla_success_metric = unavailable_metric(
+            "vla_success_per_handoff",
+            "an explicit outcome target label is required",
+            n=len(handoff_records),
+        )
+        failed_per_success = unavailable_metric(
+            "failed_vla_calls_per_success",
+            "an explicit outcome target label is required",
+            n=len(handoff_records),
+        )
+    else:
+        target_successes = sum(value is True for value in target_values)
+        failed_calls = sum(
+            value is False
+            or record.termination.failure_mode
+            in {
+                FailureMode.VLA,
+                FailureMode.RPC,
+                FailureMode.TIMEOUT,
+                FailureMode.CANCELLATION,
+            }
+            for record, value in zip(
+                handoff_records, target_values, strict=True
+            )
+        )
+        vla_success_metric = _bool_rate(
+            "vla_success_per_handoff", target_values
+        )
+        failed_per_success = _ratio_metric(
+            "failed_vla_calls_per_success",
+            failed_calls,
+            target_successes,
+            n=len(handoff_records),
+        )
     return {
         "primitive_success_rate": _bool_rate(
             "primitive_success_rate",
@@ -471,10 +522,7 @@ def evaluate_controller_records(
             "task_success_rate",
             (record.labels.task_success.value for record in records),
         ),
-        "vla_success_per_handoff": _bool_rate(
-            "vla_success_per_handoff",
-            (record.labels.skill_success.value for record in handoff_records),
-        ),
+        "vla_success_per_handoff": vla_success_metric,
         "vla_failure_rate": _bool_rate(
             "vla_failure_rate",
             (
@@ -489,12 +537,14 @@ def evaluate_controller_records(
                 for record in handoff_records
             ),
         ),
-        "failed_vla_calls_per_success": _ratio_metric(
-            "failed_vla_calls_per_success",
-            vla_failures + rpc_failures,
-            vla_successes,
-            n=len(handoff_records),
+        "timeout_rate": _bool_rate(
+            "timeout_rate",
+            (
+                record.termination.failure_mode is FailureMode.TIMEOUT
+                for record in handoff_records
+            ),
         ),
+        "failed_vla_calls_per_success": failed_per_success,
         "staging_failure_rate": _bool_rate(
             "staging_failure_rate",
             (
@@ -541,6 +591,11 @@ def evaluate_controller_records(
             (record.costs.vla_invocations for record in records),
             unit="count",
         ),
+        "vla_invocation_count": _numeric_total(
+            "vla_invocation_count",
+            (record.costs.vla_invocations for record in records),
+            unit="count",
+        ),
         "mean_analytic_steps": _numeric_summary(
             "mean_analytic_steps",
             (record.costs.analytic_steps for record in records),
@@ -571,10 +626,9 @@ def evaluate_controller_records(
             (record.costs.total_elapsed_s for record in records),
             unit="s",
         ),
-        "intervention_count": unavailable_metric(
+        "intervention_count": _numeric_total(
             "intervention_count",
-            "within-VLA intervention is outside the pre-handoff execution scope",
-            n=len(records),
+            (record.costs.intervention_count for record in records),
             unit="count",
         ),
     }
@@ -609,10 +663,14 @@ def evaluate_system_records(
             (record.costs.planner_time_s for record in records),
             unit="s",
         ),
-        "recovery_retry_cost": unavailable_metric(
+        "analytic_time_s": _numeric_summary(
+            "analytic_time_s",
+            (record.costs.system_analytic_time_s for record in records),
+            unit="s",
+        ),
+        "recovery_retry_cost": _numeric_summary(
             "recovery_retry_cost",
-            "no authoritative recovery/retry cost field is present",
-            n=len(records),
+            (record.costs.recovery_retry_cost for record in records),
             unit="cost",
         ),
         "wall_clock_p50_s": _numeric_summary(

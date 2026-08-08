@@ -1,5 +1,5 @@
 {
-  "schema_version": "rpent.handoff-gate0-job/v1",
+  "schema_version": "rpent.handoff-gate0-job/v2",
   "output_dir": "${RPENT_HANDOFF_OUTPUT_ROOT}/gate0/${RPENT_GATE0_RUN_ID}",
   "adapter_factory": "robots.libero.handoff_experiments:build_gate0_adapter_bundle",
   "adapter_config": {
@@ -16,7 +16,7 @@
       "pi05_checkpoint_id": "${RPENT_PI05_CHECKPOINT_ID}",
       "sam3_checkpoint_id": "${RPENT_SAM3_CHECKPOINT_ID}"
     },
-    "handoff_config": "configs/research/handoff/policies/gate0_direct_perception.json",
+    "handoff_config": "../policies/gate0_direct_perception.json",
     "vla_method": "pi0_pick",
     "setup_target": {
       "raw_observation_key": "${RPENT_GATE0_TARGET_POSITION_KEY}",
@@ -34,6 +34,20 @@
     "labeler_factory": null,
     "training_target_label": "primitive_success"
   },
+  "runtime_probes": [
+    {
+      "name": "gate0-readonly-preflight",
+      "path": "${RPENT_RUNTIME_PROBE_READONLY}",
+      "required_observed_facts": [
+        "env.endpoint_health",
+        "env.reset_identity",
+        "vla.endpoint_health",
+        "vla.model_checkpoint_identity",
+        "sam3.endpoint_health",
+        "sam3.model_checkpoint_identity"
+      ]
+    }
+  ],
   "gate0": {
     "sampler": {
       "mode": "latin_hypercube",
@@ -46,10 +60,11 @@
       "approach_axis_world": [0.0, 0.0, 1.0],
       "random_samples": 64,
       "repeats": 3,
-      "seed": 20260808,
+      "seed": "${RPENT_GATE0_SAMPLER_SEED}",
       "maximum_total_trials": 100000
     },
     "staging_tolerance_m": 0.012,
+    "staging_orientation_tolerance_rad": 0.05,
     "staging_step_m": 0.025,
     "max_staging_steps": 80,
     "max_staging_distance_m": 0.5,
@@ -69,7 +84,7 @@
   "controller_implementation_version": "rpent-libero-gate0/v1",
   "checkpoint_id": "${RPENT_PI05_CHECKPOINT_ID}",
   "configuration_id": null,
-  "source_revision": null,
+  "source_revision": "${RPENT_SOURCE_REVISION}",
   "metadata": {
     "status": "experimentally_unverified",
     "setup_target_is_privileged": true,

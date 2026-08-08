@@ -76,6 +76,7 @@ class Gate0SamplerConfig(HandoffRecord):
 
 class Gate0Sample(HandoffRecord):
     schema_version: Literal[GATE0_SAMPLE_SCHEMA_VERSION] = GATE0_SAMPLE_SCHEMA_VERSION
+    candidate_id: str
     sample_id: str
     sample_index: int = Field(ge=0)
     repeat_index: int = Field(ge=0)
@@ -84,10 +85,46 @@ class Gate0Sample(HandoffRecord):
     wrist_yaw_rad: float
     wrist_pitch_rad: float
 
+    @field_validator("candidate_id", "sample_id")
+    @classmethod
+    def validate_ids(cls, value: str, info) -> str:
+        if not value:
+            raise ValueError(f"{info.field_name} must be non-empty")
+        return value
+
 
 def _sample_id(payload: dict[str, object]) -> str:
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
     return "gate0-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:20]
+
+
+def _candidate_id(
+    row: tuple[float, ...],
+    *,
+    approach_axis_world: tuple[float, float, float],
+) -> str:
+    """Identify the requested geometry independently of execution repeat."""
+    canonical = json.dumps(
+        {
+            "schema_version": "rpent.handoff-gate0-candidate/v1",
+            "relative_xyz_m": row[:3],
+            "standoff_m": row[3],
+            "wrist_yaw_rad": row[4],
+            "wrist_pitch_rad": row[5],
+            "approach_axis_world": approach_axis_world,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return "candidate-" + hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()[:20]
 
 
 def _rows_grid(config: Gate0SamplerConfig) -> list[tuple[float, ...]]:
@@ -164,13 +201,18 @@ def generate_gate0_samples(config: Gate0SamplerConfig) -> tuple[Gate0Sample, ...
     for repeat_index in range(config.repeats):
         for row in rows:
             x, y, z, standoff, yaw, pitch = row
+            candidate_id = _candidate_id(
+                row,
+                approach_axis_world=config.approach_axis_world,
+            )
             payload = {
-                "sampler": config.canonical_json(),
-                "row": row,
+                "schema_version": GATE0_SAMPLE_SCHEMA_VERSION,
+                "candidate_id": candidate_id,
                 "repeat_index": repeat_index,
             }
             samples.append(
                 Gate0Sample(
+                    candidate_id=candidate_id,
                     sample_id=_sample_id(payload),
                     sample_index=sample_index,
                     repeat_index=repeat_index,
@@ -198,4 +240,3 @@ def sample_world_position(
         + axis * sample.standoff_m
     )
     return tuple(float(value) for value in world)  # type: ignore[return-value]
-

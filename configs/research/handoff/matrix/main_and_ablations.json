@@ -171,6 +171,56 @@
       "hierarchy": "local_governor"
     },
     {
+      "name": "ablation-evidence-outcome-projection-relative",
+      "execution_layer": "controlled",
+      "method": "competence_projection",
+      "handoff_enabled": true,
+      "handoff_config": "../policies/competence_projection_target_relative.json",
+      "model_artifact": "${RPENT_HANDOFF_MODEL_RELATIVE}",
+      "feature_set": "target_relative",
+      "evidence": "success_and_failure",
+      "decision": "projection",
+      "uncertainty": "mean_only",
+      "hierarchy": "local_governor"
+    },
+    {
+      "name": "ablation-evidence-positive-projection-relative",
+      "execution_layer": "controlled",
+      "method": "positive_nearest_success",
+      "handoff_enabled": true,
+      "handoff_config": "../policies/positive_retrieval.json",
+      "feature_set": "target_relative",
+      "evidence": "success_only",
+      "decision": "projection",
+      "uncertainty": "mean_only",
+      "hierarchy": "local_governor"
+    },
+    {
+      "name": "ablation-decision-fixed",
+      "execution_layer": "controlled",
+      "method": "fixed_canonical_precontact",
+      "handoff_enabled": true,
+      "handoff_config": "../policies/canonical_staging_deployment_full.json",
+      "feature_set": "deployment_full",
+      "evidence": "success_and_failure",
+      "decision": "fixed",
+      "uncertainty": "mean_only",
+      "hierarchy": "local_governor"
+    },
+    {
+      "name": "ablation-decision-threshold",
+      "execution_layer": "controlled",
+      "method": "competence_probability_threshold",
+      "handoff_enabled": true,
+      "handoff_config": "../policies/competence_threshold_mean.json",
+      "model_artifact": "${RPENT_HANDOFF_MODEL_FULL}",
+      "feature_set": "deployment_full",
+      "evidence": "success_and_failure",
+      "decision": "threshold",
+      "uncertainty": "mean_only",
+      "hierarchy": "local_governor"
+    },
+    {
       "name": "full-original-harness",
       "execution_layer": "full_agent",
       "method": "original_harness",
@@ -194,19 +244,6 @@
       "decision": "online_switching",
       "uncertainty": "conservative",
       "hierarchy": "local_governor"
-    },
-    {
-      "name": "posthoc-oracle-upper-bound",
-      "execution_layer": "gate0",
-      "method": "posthoc_oracle_upper_bound",
-      "handoff_enabled": false,
-      "handoff_config": null,
-      "feature_set": "deployment_full",
-      "evidence": "success_and_failure",
-      "decision": "oracle",
-      "uncertainty": "mean_only",
-      "hierarchy": "not_applicable",
-      "parameters": {"posthoc_only": true, "matched_context_required": true}
     }
   ],
   "runtime": {
@@ -222,16 +259,86 @@
     "pi05_checkpoint_id": "${RPENT_PI05_CHECKPOINT_ID}",
     "sam3_checkpoint_id": "${RPENT_SAM3_CHECKPOINT_ID}"
   },
+  "runtime_probes": [
+    {
+      "name": "read-only",
+      "path": "${RPENT_RUNTIME_PROBE_READONLY}",
+      "required_observed_facts": [
+        "env.endpoint_health",
+        "env.observation_keys",
+        "env.state_vector_shape",
+        "env.camera_views",
+        "env.reset_identity",
+        "vla.endpoint_health",
+        "vla.model_checkpoint_identity",
+        "sam3.endpoint_health",
+        "sam3.model_checkpoint_identity"
+      ]
+    },
+    {
+      "name": "vla-inference",
+      "path": "${RPENT_RUNTIME_PROBE_INFERENCE}",
+      "required_observed_facts": [
+        "vla.actual_action_shape",
+        "vla.actual_chunk_size",
+        "vla.model_checkpoint_identity"
+      ]
+    },
+    {
+      "name": "sam3-inference",
+      "path": "${RPENT_RUNTIME_PROBE_SAM3}",
+      "required_observed_facts": [
+        "sam3.current_observation_contract",
+        "sam3.current_observation_acceptance",
+        "sam3.model_checkpoint_identity"
+      ]
+    }
+  ],
   "planner": {
     "backend": "api",
-    "model": null,
-    "base_url": null,
+    "model": "${RPENT_PLANNER_MODEL}",
+    "base_url": "${RPENT_PLANNER_BASE_URL}",
     "max_turns": 100,
     "max_tokens": 8192,
     "planner_timeout_s": 1200,
     "claude_code_max_budget_usd": null,
     "no_images": false
   },
-  "source_revision": null,
-  "metadata": {"status": "experimentally_unverified", "oracle_is_posthoc": true}
+  "source_revision": "${RPENT_SOURCE_REVISION}",
+  "metadata": {
+    "status": "experimentally_unverified",
+    "oracle_is_posthoc": true,
+    "oracle_workflow": "rpent-handoff materialize-oracle",
+    "ablation_groups": {
+      "A_evidence": {
+        "success_only": "ablation-evidence-positive-projection-relative",
+        "success_and_failure": "ablation-evidence-outcome-projection-relative",
+        "controlled_factors": ["representation=target_relative", "decision=projection", "uncertainty=mean_only", "hierarchy=local_governor"],
+        "interpretation": "evidence-family comparison; estimator family necessarily changes and is reported"
+      },
+      "B_representation": {
+        "absolute": "ablation-representation-absolute",
+        "target_relative": "ablation-representation-relative",
+        "target_relative_visual": "ablation-representation-relative-visual",
+        "controlled_factors": ["method=outcome_calibrated_switching", "evidence=success_and_failure", "decision=online_switching", "uncertainty=conservative", "hierarchy=local_governor"]
+      },
+      "C_decision": {
+        "fixed": "ablation-decision-fixed",
+        "threshold": "ablation-decision-threshold",
+        "projection": "controlled-competence-projection",
+        "online_switching": "ablation-uncertainty-mean",
+        "controlled_factors": ["representation=deployment_full", "evidence=success_and_failure", "uncertainty=mean_only", "hierarchy=local_governor"]
+      },
+      "D_uncertainty": {
+        "mean_only": "ablation-uncertainty-mean",
+        "conservative": "controlled-ours-conservative",
+        "controlled_factors": ["method=outcome_calibrated_switching", "representation=deployment_full", "evidence=success_and_failure", "decision=online_switching", "hierarchy=local_governor"]
+      },
+      "E_hierarchy": {
+        "planner_mediated": "full-original-harness",
+        "local_governor": "full-local-governor",
+        "interpretation": "system hierarchy comparison; method and decision mechanism are intentionally reported confounders, not an isolated controller effect"
+      }
+    }
+  }
 }

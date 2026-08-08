@@ -22,7 +22,19 @@ class SourceIdentity(HandoffRecord):
     git_revision: str | None = None
     dirty: bool | None = None
     package_version: str | None = None
+    source_revision: str | None = None
     external_runtime_identity: str | None = None
+    external_runtime_identity_sha256: str | None = None
+
+    @model_validator(mode="after")
+    def validate_content_bindings(self):
+        if (self.external_runtime_identity is None) != (
+            self.external_runtime_identity_sha256 is None
+        ):
+            raise ValueError(
+                "external runtime identity path and checksum must be jointly present"
+            )
+        return self
 
 
 class ModelArtifactManifest(HandoffRecord):

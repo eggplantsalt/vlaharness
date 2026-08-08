@@ -308,9 +308,24 @@ def test_label_extraction_never_turns_non_vla_failures_into_negatives() -> None:
     )
     no_invocation = _outcome(4, handoff=True, vla_invocations=0)
     unknown = _outcome(5, skill_value=None)
+    label_failure = _outcome(
+        6,
+        handoff=True,
+        failure=FailureMode.OUTCOME_LABEL,
+        reason=TerminationReason.OUTCOME_LABEL_FAILURE,
+        final_state=GovernorState.OUTCOME_LABEL_FAILURE,
+    )
 
     result = extract_labeled_outcomes(
-        (success, no_handoff, staging, perception, no_invocation, unknown),
+        (
+            success,
+            no_handoff,
+            staging,
+            perception,
+            no_invocation,
+            unknown,
+            label_failure,
+        ),
         target=TrainingTarget.SKILL_SUCCESS,
     )
     assert [(item.record.record_id, item.value) for item in result.included] == [
@@ -323,6 +338,7 @@ def test_label_extraction_never_turns_non_vla_failures_into_negatives() -> None:
         "outcome-3": ExclusionReason.PERCEPTION_FAILURE,
         "outcome-4": ExclusionReason.NO_VLA_INVOCATION,
         "outcome-5": ExclusionReason.TARGET_LABEL_UNAVAILABLE,
+        "outcome-6": ExclusionReason.OUTCOME_LABEL_FAILURE,
     }
 
 

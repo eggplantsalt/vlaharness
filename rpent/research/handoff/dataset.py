@@ -553,6 +553,7 @@ class ExclusionReason(str, Enum):
     NO_HANDOFF = "no_handoff"
     NO_VLA_INVOCATION = "no_vla_invocation"
     UNKNOWN_VLA_INVOCATION_COUNT = "unknown_vla_invocation_count"
+    OUTCOME_LABEL_FAILURE = "outcome_label_failure"
     MISSING_PRE_HANDOFF_STATE = "missing_pre_handoff_state"
     TARGET_LABEL_UNAVAILABLE = "target_label_unavailable"
 
@@ -636,6 +637,8 @@ def _training_exclusion(record: OutcomeRecord) -> ExclusionReason | None:
     if record_scope not in (None, "handoff_invocation"):
         return ExclusionReason.NON_INVOCATION_SCOPE
     failure = record.termination.failure_mode
+    if failure is FailureMode.OUTCOME_LABEL:
+        return ExclusionReason.OUTCOME_LABEL_FAILURE
     reason = record.termination.reason
     if failure is FailureMode.STAGING or reason is TerminationReason.STAGING_FAILURE:
         return ExclusionReason.STAGING_FAILURE
