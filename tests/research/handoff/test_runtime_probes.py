@@ -23,6 +23,9 @@ from rpent.research.handoff.experiments.probes import (
     run_runtime_probes,
 )
 from rpent.research.handoff.experiments.config import ExperimentConfig
+from rpent.research.handoff.experiments.full_agent_outcomes import (
+    load_probe_reset_map,
+)
 from rpent.research.handoff.experiments.manifest import (
     expand_manifest,
     verify_manifest_external_bindings,
@@ -268,8 +271,8 @@ def test_gate0_job_binds_handoff_and_probe_bytes_and_rechecks_them(tmp_path) -> 
                 "gate0": {},
                 "run_id": "gate0-run",
                 "suite": "libero_object",
-                "task_id": 0,
-                "seed": 0,
+                "task_id": 2,
+                "seed": 7,
                 "target_id": "cup",
                 "target_description": "the cup",
                 "skill_name": "pick",
@@ -282,6 +285,22 @@ def test_gate0_job_binds_handoff_and_probe_bytes_and_rechecks_them(tmp_path) -> 
         + "\n",
         encoding="utf-8",
     )
+
+    mismatched_payload = artifact.model_dump(mode="json", exclude_none=False)
+    reset_fact = next(
+        fact
+        for fact in mismatched_payload["report"]["facts"]
+        if fact["name"] == "env.reset_identity"
+    )
+    reset_fact["value"]["context"]["seed"] = 8
+    probe_path.write_text(
+        RuntimeProbeArtifact.model_validate(mismatched_payload).canonical_json()
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="reset context"):
+        load_gate0_job(job_path)
+    probe_path.write_text(artifact.canonical_json() + "\n", encoding="utf-8")
 
     job = load_gate0_job(job_path)
 
@@ -477,6 +496,18 @@ def test_runtime_probe_artifact_envelope_round_trips_strictly() -> None:
     assert decoded.report.fact("vla.model_checkpoint_identity").value[
         "checkpoint"
     ]["configured_id"] == "sha256:pi05-test"
+
+
+def test_full_agent_probe_reset_consumer_reads_typed_artifact_envelope(
+    tmp_path,
+) -> None:
+    artifact = _ready_probe_artifact()
+    path = tmp_path / "runtime-probe.json"
+    path.write_text(artifact.canonical_json() + "\n", encoding="utf-8")
+
+    reset_map = load_probe_reset_map((path,))
+
+    assert reset_map == {("libero_object", 2, 7): "reset-004"}
 
 
 def test_manifest_identity_binds_runtime_probe_bytes_and_detects_mutation(

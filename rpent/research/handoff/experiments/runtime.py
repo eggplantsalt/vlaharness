@@ -8,7 +8,9 @@ Gate-0 adapter factories use the ``module:callable`` contract.  The callable
 is invoked with keyword arguments ``job``, ``adapter_config``,
 ``gate0_config``, and ``output_dir``.  It may return the adapter directly or a
 mapping with an ``adapter`` entry and optional ``setup_sink`` and ``cleanup``
-entries.  ``cleanup`` must be a zero-argument callable.
+entries. Server-executable Gate-0 factories must also return a live
+``runtime_attestation`` and its exact sidecar SHA-256. ``cleanup`` must be a
+zero-argument callable.
 """
 
 from __future__ import annotations
@@ -418,6 +420,9 @@ def _validate_probe_binding(
     *,
     path: Path,
     runtime: RuntimeConfig,
+    expected_suite: str,
+    expected_task_id: int | str,
+    expected_seed: int,
 ) -> Gate0RuntimeProbeBinding:
     from rpent.research.handoff.experiments.config import load_strict_json
 
@@ -450,6 +455,22 @@ def _validate_probe_binding(
         raise ValueError(
             f"Gate-0 probe {reference.name!r} lacks observed facts: {missing}"
         )
+    reset_fact = facts["env.reset_identity"]
+    if reset_fact.status is ProbeStatus.OBSERVED:
+        if not isinstance(reset_fact.value, Mapping):
+            raise ValueError(
+                f"env reset identity in {reference.name!r} is not an object"
+            )
+        context = reset_fact.value.get("context")
+        if not isinstance(context, Mapping) or (
+            context.get("suite") != expected_suite
+            or str(context.get("task")) != str(expected_task_id)
+            or context.get("seed") != expected_seed
+        ):
+            raise ValueError(
+                f"env reset context in {reference.name!r} disagrees with "
+                "the Gate-0 suite/task/seed"
+            )
     expected_ids = {
         "vla": runtime.pi05_checkpoint_id,
         "sam3": runtime.sam3_checkpoint_id,
@@ -549,7 +570,14 @@ def _resolved_gate0_bindings(
         resolved = reference.model_copy(update={"path": str(probe_path)})
         resolved_references.append(resolved)
         probe_bindings.append(
-            _validate_probe_binding(resolved, path=probe_path, runtime=runtime)
+            _validate_probe_binding(
+                resolved,
+                path=probe_path,
+                runtime=runtime,
+                expected_suite=job.suite,
+                expected_task_id=job.task_id,
+                expected_seed=job.seed,
+            )
         )
     required = {
         fact
@@ -715,6 +743,9 @@ def verify_gate0_job_external_bindings(
             references[binding.name],
             path=path,
             runtime=runtime,
+            expected_suite=job.suite,
+            expected_task_id=job.task_id,
+            expected_seed=job.seed,
         )
         if current != binding:
             raise ValueError(
@@ -778,6 +809,9 @@ def gate0_plan_id(
     payload = {
         "schema_version": "rpent.handoff-gate0-child-plan/v2",
         "job_configuration_id": job.stable_configuration_id,
+        "run_id": job.run_id,
+        "episode_prefix": job.episode_prefix,
+        "output_dir": str(Path(job.output_dir).expanduser().resolve()),
         "repo_root": str(Path(repo_root).expanduser().resolve()),
         "limit": limit,
         "resume": resume,

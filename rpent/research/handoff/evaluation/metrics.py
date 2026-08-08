@@ -638,7 +638,26 @@ def evaluate_system_records(
     records: Sequence[OutcomeRecord],
 ) -> dict[str, MetricValue]:
     """Aggregate full-system telemetry, preserving unavailable fields as null."""
+    system_attempt_values: list[bool | None] = []
+    for record in records:
+        marker = record.metadata.get("system_attempt_success")
+        if marker is None:
+            if record.metadata.get("denominator_eligible") is True:
+                raise ValueError(
+                    "denominator-eligible record lacks system_attempt_success: "
+                    f"{record.record_id}"
+                )
+            marker = record.labels.task_success.value
+        if marker is not None and not isinstance(marker, bool):
+            raise ValueError(
+                f"system_attempt_success must be boolean: {record.record_id}"
+            )
+        system_attempt_values.append(marker)
     return {
+        "end_to_end_attempt_success_rate": _bool_rate(
+            "end_to_end_attempt_success_rate",
+            system_attempt_values,
+        ),
         "task_success_rate": _bool_rate(
             "task_success_rate",
             (record.labels.task_success.value for record in records),

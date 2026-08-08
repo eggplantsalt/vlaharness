@@ -346,31 +346,40 @@ def main() -> int:
         direct_vla_attempts_path = (
             Path(output_dir) / "direct_vla_attempts.jsonl"
         ).resolve()
+        states_path = (Path(output_dir) / "states.json").resolve()
+        if not states_path.is_file():
+            raise RuntimeError(
+                f"research completion cannot bind missing states trace: {states_path}"
+            )
         direct_vla_attempts_sha256 = (
             hashlib.sha256(direct_vla_attempts_path.read_bytes()).hexdigest()
             if direct_vla_attempts_path.is_file()
             else None
         )
         completion_record = {
-            "schema_version": "rpent.research-completion/v1",
+            "schema_version": "rpent.research-completion/v2",
             "trial_id": str(research_trial_id),
             "manifest_id": str(args.research_manifest_id),
             "plan_id": str(args.research_plan_id),
             "source_revision": trial.source_revision,
             "status": (
                 "planner_error"
-                if agent_error
+                if agent_error is not None
                 else (
                     "finish_declared"
                     if finish_result is not None
                     else "planner_returned_without_finish"
                 )
             ),
-            "agent_error": str(agent_error) if agent_error else None,
+            "agent_error": (
+                str(agent_error) if agent_error is not None else None
+            ),
             "transcript_path": str(transcript_path.resolve()),
             "transcript_sha256": hashlib.sha256(
                 transcript_path.read_bytes()
             ).hexdigest(),
+            "states_path": str(states_path),
+            "states_sha256": hashlib.sha256(states_path.read_bytes()).hexdigest(),
             "elapsed_s": round(elapsed, 1),
             "planner_backend": args.planner,
             "planner_model": args.model,
@@ -407,10 +416,10 @@ def main() -> int:
                  stats.get('total_output_tokens', '?'),
                  stats.get('tool_calls', '?'))
     logger.info("transcript: %s", transcript_path)
-    if agent_error:
+    if agent_error is not None:
         logger.error("error: %s", agent_error)
 
-    if completion_output is not None and agent_error:
+    if completion_output is not None and agent_error is not None:
         return 1
     return 0
 

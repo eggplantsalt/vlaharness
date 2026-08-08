@@ -81,7 +81,7 @@ def _immutable_json(path: str | os.PathLike[str], value: Any) -> Path:
         + "\n"
     )
     if destination.exists():
-        if destination.read_text(encoding="utf-8") != canonical:
+        if destination.read_bytes() != canonical.encode("utf-8"):
             raise FileExistsError(
                 f"immutable JSON artifact already differs: {destination}"
             )
@@ -91,6 +91,25 @@ def _immutable_json(path: str | os.PathLike[str], value: Any) -> Path:
         stream.flush()
         os.fsync(stream.fileno())
     return destination
+
+
+def _require_canonical_jsonl(
+    path: str | os.PathLike[str],
+    records: Sequence[Any],
+    *,
+    label: str,
+) -> None:
+    """Reject semantically equivalent rewrites of append-only evidence."""
+    source = Path(path)
+    if not source.exists():
+        if records:
+            raise ValueError(f"{label} records exist without their JSONL file")
+        return
+    expected = "".join(record.canonical_json() + "\n" for record in records).encode(
+        "utf-8"
+    )
+    if source.read_bytes() != expected:
+        raise ValueError(f"{label} JSONL bytes are not canonical append output")
 
 
 def _emit(value: Any) -> None:
@@ -608,9 +627,9 @@ class _CompositeSetupSink:
 def _cmd_gate0_child(args: argparse.Namespace) -> int:
     from rpent.research.handoff.dataset import (
         DatasetResearchSink,
-        OutcomeDataset,
         dataset_fingerprint,
         scan_decision_jsonl,
+        scan_outcome_jsonl,
     )
     from rpent.research.handoff.experiments.gate0 import (
         Gate0Adapter,
@@ -652,6 +671,7 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
             f"expected={expected_plan_id!r}, actual={args.plan_id!r}"
         )
     expected_environment = gate0_runtime_environment(job)
+    gate0_runtime = job.adapter_config["runtime"]
     actual_environment = {
         name: os.environ.get(name) for name in expected_environment
     }
@@ -698,14 +718,14 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
         "job": job.model_dump(mode="json", exclude_none=False),
     }
     run_manifest_path = output_dir / "gate0_run_manifest.json"
-    if run_manifest_path.exists():
+    run_manifest_exists = run_manifest_path.exists()
+    if run_manifest_exists:
         existing_manifest = _strict_json_object(run_manifest_path)
         if existing_manifest != run_manifest:
             raise ValueError(
                 "existing Gate-0 run manifest disagrees with this job; "
                 "choose a new output_dir/run_id"
             )
-    else:
         _immutable_json(run_manifest_path, run_manifest)
     attempt = {
         "schema_version": "rpent.handoff-gate0-attempt/v1",
@@ -723,10 +743,21 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
         # Validate the complete durable shard before constructing an adapter or
         # a writer. A torn tail is evidence requiring inspection, not something
         # a new physical process may silently truncate and continue past.
-        existing_records = OutcomeDataset.from_jsonl(
+        outcome_scan = scan_outcome_jsonl(
+            outcome_path, allow_partial_final_line=False
+        )
+        if outcome_scan.needs_trailing_newline:
+            raise ValueError(
+                "Gate-0 outcome shard lacks its durable trailing newline"
+            )
+        existing_records = tuple(
+            envelope.payload for envelope in outcome_scan.envelopes
+        )
+        _require_canonical_jsonl(
             outcome_path,
-            allow_partial_final_line=False,
-        ).records
+            outcome_scan.envelopes,
+            label="Gate-0 outcome envelope",
+        )
         trial_keys = [record.identity.trial_id for record in existing_records]
         invocation_keys = [
             (record.identity.run_id, record.identity.invocation_id)
@@ -804,6 +835,15 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
             decision_path,
             allow_partial_final_line=False,
         )
+        if decision_scan.needs_trailing_newline:
+            raise ValueError(
+                "Gate-0 decision shard lacks its durable trailing newline"
+            )
+        _require_canonical_jsonl(
+            decision_path,
+            decision_scan.envelopes,
+            label="Gate-0 decision envelope",
+        )
     attempts = {
         path.stem: _strict_json_object(path)
         for path in sorted((output_dir / "attempts").glob("*.json"))
@@ -812,7 +852,19 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
         path.stem: _strict_json_object(path)
         for path in sorted((output_dir / "collection_attempts").glob("*.json"))
     }
+    for plan_id, marker in attempts.items():
+        _immutable_json(
+            output_dir / "attempts" / f"{plan_id}.json",
+            marker,
+        )
+    for plan_id, prior_summary in attempt_summaries.items():
+        _immutable_json(
+            output_dir / "collection_attempts" / f"{plan_id}.json",
+            prior_summary,
+        )
     prior_attempt_ids = set(attempts).difference({args.plan_id})
+    if prior_attempt_ids and not run_manifest_exists:
+        raise ValueError("Gate-0 sealed attempts lack their immutable run manifest")
     if set(attempt_summaries) != prior_attempt_ids:
         raise ValueError(
             "Gate-0 resume found an unsealed attempt or orphan attempt summary; "
@@ -845,7 +897,19 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
         summary = attempt_summaries[plan_id]
         marker_anchor = marker.get("resume_anchor")
         if (
-            marker.get("schema_version") != "rpent.handoff-gate0-attempt/v1"
+            set(marker)
+            != {
+                "schema_version",
+                "plan_id",
+                "configuration_id",
+                "source_revision",
+                "resume",
+                "limit",
+                "resume_anchor",
+                "checkpoint_environment",
+            }
+            or marker.get("schema_version")
+            != "rpent.handoff-gate0-attempt/v1"
             or marker.get("plan_id") != plan_id
             or marker.get("configuration_id") != job.stable_configuration_id
             or marker.get("source_revision") != job.source_revision
@@ -877,11 +941,34 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
                 f"Gate-0 attempt plan ID does not bind its marker: {plan_id}"
             )
         if (
-            summary.get("schema_version")
+            set(summary)
+            != {
+                "schema_version",
+                "plan_id",
+                "configuration_id",
+                "source_revision",
+                "collected",
+                "resumed_completed",
+                "completed_after",
+                "dataset_fingerprint_before",
+                "dataset_fingerprint_after",
+                "runtime_attestation_id",
+                "runtime_attestation_sha256",
+                "outcome_jsonl",
+                "decision_jsonl",
+                "setup_jsonl",
+                "run_manifest",
+                "record_ids",
+            }
+            or summary.get("schema_version")
             != "rpent.handoff-gate0-attempt-summary/v1"
             or summary.get("plan_id") != plan_id
             or summary.get("configuration_id") != job.stable_configuration_id
             or summary.get("source_revision") != job.source_revision
+            or summary.get("outcome_jsonl") != str(outcome_path.resolve())
+            or summary.get("decision_jsonl") != str(decision_path.resolve())
+            or summary.get("setup_jsonl") != str(setup_path.resolve())
+            or summary.get("run_manifest") != str(run_manifest_path.resolve())
         ):
             raise ValueError(f"Gate-0 attempt summary is invalid: {plan_id}")
         record_ids = summary.get("record_ids")
@@ -891,9 +978,15 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
         ):
             raise ValueError(f"Gate-0 attempt record IDs are invalid: {plan_id}")
         if (
-            summary.get("collected") != len(record_ids)
+            isinstance(summary.get("collected"), bool)
+            or not isinstance(summary.get("collected"), int)
+            or summary.get("collected") != len(record_ids)
+            or isinstance(summary.get("resumed_completed"), bool)
             or not isinstance(summary.get("resumed_completed"), int)
+            or isinstance(summary.get("completed_after"), bool)
             or not isinstance(summary.get("completed_after"), int)
+            or summary.get("resumed_completed") < 0
+            or summary.get("completed_after") < 0
             or summary.get("completed_after")
             != summary.get("resumed_completed") + len(record_ids)
             or not isinstance(summary.get("dataset_fingerprint_before"), str)
@@ -911,47 +1004,62 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
             outcome_owner[record_id] = plan_id
         attestation_id = summary.get("runtime_attestation_id")
         attestation_sha256 = summary.get("runtime_attestation_sha256")
-        if record_ids and (
+        if (
             not isinstance(attestation_id, str)
+            or not attestation_id
             or not isinstance(attestation_sha256, str)
+            or not attestation_sha256
         ):
             raise ValueError(
-                f"Gate-0 outcome-bearing attempt lacks runtime identity: {plan_id}"
+                f"Gate-0 sealed attempt lacks runtime identity: {plan_id}"
             )
-        if attestation_id is not None or attestation_sha256 is not None:
-            if not isinstance(attestation_id, str) or not isinstance(
-                attestation_sha256, str
-            ):
-                raise ValueError(
-                    f"Gate-0 attempt runtime identity is only partially bound: {plan_id}"
-                )
-            expected_runtime_attempts.add(plan_id)
-            attestation_path = runtime_identity_paths.get(plan_id)
-            if attestation_path is None:
-                raise ValueError(
-                    f"Gate-0 runtime attestation is missing: {plan_id}"
-                )
-            actual_sha256 = hashlib.sha256(
-                attestation_path.read_bytes()
-            ).hexdigest()
-            attestation = load_runtime_attestation(attestation_path)
-            if (
-                actual_sha256 != attestation_sha256
-                or attestation.attestation_id != attestation_id
-                or attestation.plan_id != plan_id
-                or attestation.source_revision != job.source_revision
-                or tuple(
-                    item.observed_checkpoint_id
-                    for item in attestation.observations
-                )
-                != (
-                    expected_environment["RPENT_PI05_CHECKPOINT_ID"],
-                    expected_environment["RPENT_SAM3_CHECKPOINT_ID"],
-                )
-            ):
-                raise ValueError(
-                    f"Gate-0 runtime attestation is invalid: {plan_id}"
-                )
+        expected_runtime_attempts.add(plan_id)
+        attestation_path = runtime_identity_paths.get(plan_id)
+        if attestation_path is None:
+            raise ValueError(
+                f"Gate-0 runtime attestation is missing: {plan_id}"
+            )
+        actual_sha256 = hashlib.sha256(
+            attestation_path.read_bytes()
+        ).hexdigest()
+        attestation = load_runtime_attestation(attestation_path)
+        if (
+            actual_sha256 != attestation_sha256
+            or attestation_path.read_bytes()
+            != (attestation.canonical_json() + "\n").encode("utf-8")
+            or attestation.attestation_id != attestation_id
+            or attestation.trial_id != f"{job.run_id}/gate0-runtime"
+            or attestation.manifest_id is not None
+            or attestation.plan_id != plan_id
+            or attestation.source_revision != job.source_revision
+            or tuple(
+                item.observed_checkpoint_id
+                for item in attestation.observations
+            )
+            != (
+                expected_environment["RPENT_PI05_CHECKPOINT_ID"],
+                expected_environment["RPENT_SAM3_CHECKPOINT_ID"],
+            )
+            or tuple(
+                item.expected_checkpoint_path
+                for item in attestation.observations
+            )
+            != (
+                expected_environment["PI05_CHECKPOINT_PATH"],
+                expected_environment["SAM3_CHECKPOINT_PATH"],
+            )
+            or tuple(
+                item.external_endpoint
+                for item in attestation.observations
+            )
+            != (
+                gate0_runtime.get("vla_endpoint") is not None,
+                gate0_runtime.get("sam3_endpoint") is not None,
+            )
+        ):
+            raise ValueError(
+                f"Gate-0 runtime attestation is invalid: {plan_id}"
+            )
     if set(runtime_identity_paths) != expected_runtime_attempts:
         raise ValueError(
             "Gate-0 resume found an orphan runtime identity sidecar"
@@ -1002,6 +1110,10 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
             raise ValueError(
                 "Gate-0 sealed attempt output fingerprints do not form a chain"
             )
+    if tuple(cumulative_records) != existing_records:
+        raise ValueError(
+            "Gate-0 durable outcome order disagrees with its sealed attempt chain"
+        )
     for record_id, plan_id in outcome_owner.items():
         record = existing_by_id[record_id]
         summary = attempt_summaries[plan_id]
@@ -1018,19 +1130,39 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
     decision_count = (
         len(decision_scan.envelopes) if decision_scan is not None else 0
     )
-    handoff_outcome_count = sum(
-        1 for record in existing_records if record.handoff_occurred
+    expected_decisions = tuple(
+        decision
+        for record in existing_records
+        for decision in record.decision_trace
     )
-    if decision_count != handoff_outcome_count:
+    observed_decisions = (
+        tuple(envelope.payload for envelope in decision_scan.envelopes)
+        if decision_scan is not None
+        else ()
+    )
+    if decision_count != len(expected_decisions) or (
+        observed_decisions != expected_decisions
+    ):
         raise ValueError(
-            "Gate-0 decision and handoff-outcome shards are not a sealed pair"
+            "Gate-0 decision shard does not exactly match outcome decision traces"
         )
     if decision_scan is not None and any(
         envelope.payload.action.value != "handoff_now"
         for envelope in decision_scan.envelopes
     ):
         raise ValueError("Gate-0 direct collection contains a non-handoff decision")
+    if setup_path.exists():
+        setup_bytes = setup_path.read_bytes()
+        if setup_bytes and not setup_bytes.endswith((b"\n", b"\r")):
+            raise ValueError(
+                "Gate-0 setup shard lacks its durable trailing newline"
+            )
     durable_setup = SetupJsonlSink(setup_path)
+    _require_canonical_jsonl(
+        setup_path,
+        durable_setup.records,
+        label="Gate-0 privileged setup",
+    )
     if args.resume and durable_setup.records:
         def setup_is_valid(record: Any) -> bool:
             sample = expected_samples.get(record.identity.trial_id)
@@ -1163,19 +1295,37 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
         )
     pending_trial_ids = set(expected_samples).difference(completed_trial_ids)
     if not pending_trial_ids:
-        if not summary_path.is_file():
+        if not run_manifest_exists or not summary_path.is_file():
             raise ValueError(
                 "Gate-0 outcomes are complete but the immutable final summary "
                 "is missing; this is an unsealed prior attempt"
             )
         final_summary = _strict_json_object(summary_path)
+        _immutable_json(summary_path, final_summary)
         if (
-            final_summary.get("schema_version")
+            set(final_summary)
+            != {
+                "schema_version",
+                "configuration_id",
+                "source_revision",
+                "completed",
+                "expected",
+                "dataset_fingerprint",
+                "run_manifest",
+                "attempt_plan_ids",
+                "record_ids",
+            }
+            or final_summary.get("schema_version")
             != "rpent.handoff-gate0-collection-summary/v2"
             or final_summary.get("configuration_id")
             != job.stable_configuration_id
             or final_summary.get("source_revision") != job.source_revision
+            or isinstance(final_summary.get("completed"), bool)
+            or not isinstance(final_summary.get("completed"), int)
             or final_summary.get("completed") != len(expected_samples)
+            or isinstance(final_summary.get("expected"), bool)
+            or not isinstance(final_summary.get("expected"), int)
+            or final_summary.get("expected") != len(expected_samples)
             or final_summary.get("dataset_fingerprint")
             != dataset_fingerprint(existing_records)
             or final_summary.get("attempt_plan_ids")
@@ -1193,6 +1343,8 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
             "Gate-0 final summary exists while expected trials are missing"
         )
     if args.limit == 0:
+        verify_gate0_job_external_bindings(job, repo_root=Path.cwd())
+        _immutable_json(run_manifest_path, run_manifest)
         _emit(
             {
                 "schema_version": "rpent.handoff-gate0-noop/v1",
@@ -1203,6 +1355,10 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
         )
         return 0
 
+    # Re-evaluate repository and artifact bytes immediately before sealing the
+    # attempt and dynamically importing the adapter factory.
+    verify_gate0_job_external_bindings(job, repo_root=Path.cwd())
+    _immutable_json(run_manifest_path, run_manifest)
     _immutable_json(attempt_path, attempt)
     execution_job = job.model_copy(
         update={
@@ -1226,6 +1382,9 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
         if (
             bundle.runtime_attestation is None
             or not isinstance(bundle.runtime_attestation_sha256, str)
+            or bundle.runtime_attestation.trial_id
+            != f"{job.run_id}/gate0-runtime"
+            or bundle.runtime_attestation.manifest_id is not None
             or bundle.runtime_attestation.plan_id != args.plan_id
             or bundle.runtime_attestation.source_revision != job.source_revision
             or tuple(
@@ -1236,9 +1395,45 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
                 expected_environment["RPENT_PI05_CHECKPOINT_ID"],
                 expected_environment["RPENT_SAM3_CHECKPOINT_ID"],
             )
+            or tuple(
+                item.expected_checkpoint_path
+                for item in bundle.runtime_attestation.observations
+            )
+            != (
+                expected_environment["PI05_CHECKPOINT_PATH"],
+                expected_environment["SAM3_CHECKPOINT_PATH"],
+            )
+            or tuple(
+                item.external_endpoint
+                for item in bundle.runtime_attestation.observations
+            )
+            != (
+                gate0_runtime.get("vla_endpoint") is not None,
+                gate0_runtime.get("sam3_endpoint") is not None,
+            )
         ):
             raise RuntimeError(
                 "Gate-0 adapter did not return the required live runtime attestation"
+            )
+        current_attestation_path = (
+            output_dir / "runtime_identity" / f"{args.plan_id}.json"
+        )
+        if not current_attestation_path.is_file():
+            raise RuntimeError("Gate-0 live runtime attestation sidecar is missing")
+        persisted_attestation = load_runtime_attestation(
+            current_attestation_path
+        )
+        if (
+            persisted_attestation != bundle.runtime_attestation
+            or hashlib.sha256(current_attestation_path.read_bytes()).hexdigest()
+            != bundle.runtime_attestation_sha256
+            or current_attestation_path.read_bytes()
+            != (bundle.runtime_attestation.canonical_json() + "\n").encode(
+                "utf-8"
+            )
+        ):
+            raise RuntimeError(
+                "Gate-0 live runtime attestation sidecar disagrees with adapter"
             )
         outcome_sink = DatasetResearchSink(dataset_dir, fsync=True)
         setup_sink = (
@@ -1286,21 +1481,84 @@ def _cmd_gate0_child(args: argparse.Namespace) -> int:
         if bundle.cleanup is not None:
             bundle.cleanup()
 
-    all_records = OutcomeDataset.from_jsonl(
+    final_outcome_scan = scan_outcome_jsonl(
         outcome_path,
         allow_partial_final_line=False,
-    ).records
+    )
+    if final_outcome_scan.needs_trailing_newline:
+        raise RuntimeError("Gate-0 outcome shard ended without a trailing newline")
+    all_records = tuple(
+        envelope.payload for envelope in final_outcome_scan.envelopes
+    )
+    _require_canonical_jsonl(
+        outcome_path,
+        final_outcome_scan.envelopes,
+        label="Gate-0 outcome envelope",
+    )
+    existing_record_ids = {record.record_id for record in existing_records}
+    returned_record_ids = {record.record_id for record in outcomes}
+    if (
+        len(returned_record_ids) != len(outcomes)
+        or returned_record_ids.intersection(existing_record_ids)
+        or {record.record_id for record in all_records}
+        != existing_record_ids.union(returned_record_ids)
+    ):
+        raise RuntimeError(
+            "Gate-0 collector return values do not exactly explain new outcomes"
+        )
+    invalid_new_outcomes = [
+        record.record_id
+        for record in outcomes
+        if (
+            record.source_revision != job.source_revision
+            or record.controller.checkpoint_id != job.checkpoint_id
+            or record.controller.configuration_id
+            != job.stable_configuration_id
+            or record.metadata.get("gate0_configuration_id")
+            != job.stable_configuration_id
+            or record.metadata.get("execution_plan_id") != args.plan_id
+            or record.metadata.get("runtime_attestation_id")
+            != bundle.runtime_attestation.attestation_id
+            or record.metadata.get("runtime_attestation_sha256")
+            != bundle.runtime_attestation_sha256
+            or record.metadata.get("gate0_candidate_id")
+            != record.identity.candidate_id
+            or record.metadata.get("gate0_repeat_index")
+            != record.identity.repeat_index
+        )
+    ]
+    if invalid_new_outcomes:
+        raise RuntimeError(
+            "new Gate-0 outcomes lack exact job/runtime provenance: "
+            f"{invalid_new_outcomes[:10]}"
+        )
     all_decisions = scan_decision_jsonl(
         decision_path,
         allow_partial_final_line=False,
     )
-    if len(all_decisions.envelopes) != sum(
-        1 for record in all_records if record.handoff_occurred
+    if all_decisions.needs_trailing_newline:
+        raise RuntimeError("Gate-0 decision shard ended without a trailing newline")
+    _require_canonical_jsonl(
+        decision_path,
+        all_decisions.envelopes,
+        label="Gate-0 decision envelope",
+    )
+    if tuple(
+        envelope.payload for envelope in all_decisions.envelopes
+    ) != tuple(
+        decision
+        for record in all_records
+        for decision in record.decision_trace
     ):
         raise RuntimeError(
-            "Gate-0 collection ended with unpaired decision/outcome shards"
+            "Gate-0 collection ended with mismatched decision/outcome traces"
         )
     final_setup_ids = {record.record_id for record in durable_setup.records}
+    _require_canonical_jsonl(
+        setup_path,
+        durable_setup.records,
+        label="Gate-0 privileged setup",
+    )
     final_referenced_setup_ids = {
         record.setup_record_id
         for record in all_records
@@ -2238,6 +2496,20 @@ def _cmd_run_full_agent(args: argparse.Namespace) -> int:
         args,
         layer="full_agent",
     )
+    previously_started = {
+        event.trial_id
+        for event in journal.read()
+        if event.event.value == "started"
+    }
+    repeated_trial_ids = sorted(
+        trial.trial_id for trial in trials if trial.trial_id in previously_started
+    )
+    if repeated_trial_ids:
+        raise RuntimeError(
+            "full-agent trial IDs are single-attempt identities; preserve the "
+            "existing lifecycle/artifacts and generate new trial identities: "
+            f"{repeated_trial_ids}"
+        )
     if not trials:
         _emit({"dry_run": not args.execute, "trials": 0, "reason": "no selected pending trials"})
         return 0
@@ -2272,7 +2544,11 @@ def _cmd_run_full_agent(args: argparse.Namespace) -> int:
                 *Path(plan.output_dir).glob("transcript_*.json"),
                 Path(plan.output_dir) / "states.json",
                 Path(plan.output_dir) / "reset_identity.json",
+                Path(plan.output_dir) / "attempt.json",
+                Path(plan.output_dir) / "runtime_identity.json",
                 Path(plan.output_dir) / "completion.json",
+                Path(plan.output_dir) / "direct_vla_attempts.jsonl",
+                Path(plan.output_dir) / "resolved_handoff_runtime.json",
                 Path(plan.output_dir) / "handoff" / "outcomes.jsonl",
             )
             if path.exists()
@@ -2330,10 +2606,12 @@ def _cmd_summarize_full_agent(args: argparse.Namespace) -> int:
         dataset_fingerprint,
     )
     from rpent.research.handoff.experiments.config import ExecutionLayer
+    from rpent.research.handoff.experiments.full_agent import load_child_plans
     from rpent.research.handoff.experiments.full_agent_outcomes import (
         load_probe_reset_map,
         summarize_full_agent_trial,
     )
+    from rpent.research.handoff.experiments.lifecycle import read_lifecycle_events
     from rpent.research.handoff.experiments.manifest import load_manifest
 
     manifest = load_manifest(args.manifest)
@@ -2358,9 +2636,47 @@ def _cmd_summarize_full_agent(args: argparse.Namespace) -> int:
     if not selected:
         raise ValueError("no full-agent trials match the requested summary filters")
 
+    plans_by_trial: dict[str, Any] = {}
+    resolved_manifest_path = Path(args.manifest).expanduser().resolve()
+    for plans_path in args.plans:
+        for plan in load_child_plans(plans_path):
+            if plan.trial_id in plans_by_trial:
+                raise ValueError(
+                    f"duplicate reviewed plan for trial {plan.trial_id!r}"
+                )
+            if plan.manifest_id != manifest.manifest_id or Path(
+                plan.manifest_path
+            ).expanduser().resolve() != resolved_manifest_path:
+                raise ValueError(
+                    f"reviewed plan {plan.plan_id!r} does not bind --manifest"
+                )
+            plans_by_trial[plan.trial_id] = plan
+    missing_plans = sorted(
+        trial.trial_id
+        for trial in selected
+        if trial.trial_id not in plans_by_trial
+    )
+    if missing_plans:
+        raise ValueError(
+            f"selected full-agent trials lack reviewed plans: {missing_plans}"
+        )
+    lifecycle_events = read_lifecycle_events(args.journal, missing_ok=False)
+    unknown_lifecycle_trials = sorted(
+        {event.trial_id for event in lifecycle_events}.difference(known_trial_ids)
+    )
+    if unknown_lifecycle_trials:
+        raise ValueError(
+            "lifecycle journal contains trials outside the manifest: "
+            f"{unknown_lifecycle_trials}"
+        )
     probe_resets = load_probe_reset_map(args.runtime_probe or ())
     records = tuple(
-        summarize_full_agent_trial(trial, probe_resets=probe_resets)
+        summarize_full_agent_trial(
+            trial,
+            plan=plans_by_trial[trial.trial_id],
+            lifecycle_events=lifecycle_events,
+            probe_resets=probe_resets,
+        )
         for trial in selected
     )
     destination = Path(args.output)
@@ -2632,6 +2948,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create one checksummed OutcomeRecord per completed full-agent episode.",
     )
     summarize_full_agent.add_argument("--manifest", required=True)
+    summarize_full_agent.add_argument(
+        "--plans",
+        action="append",
+        required=True,
+        help="Reviewed full-agent child-plan JSON; repeatable.",
+    )
+    summarize_full_agent.add_argument(
+        "--journal",
+        required=True,
+        help="Terminal full-agent lifecycle journal.",
+    )
     summarize_full_agent.add_argument(
         "--runtime-probe",
         action="append",

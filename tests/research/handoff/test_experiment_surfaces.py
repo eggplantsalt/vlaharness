@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -34,11 +35,14 @@ from rpent.research.handoff.experiments.full_agent import (
     build_child_plan,
     build_full_agent_command,
     execute_child_plan,
+    load_child_plans,
+    write_child_plans,
 )
 from rpent.research.handoff.experiments.lifecycle import (
     LifecycleJournal,
     TrialEventType,
     derive_resume_states,
+    read_lifecycle_events,
 )
 from rpent.research.handoff.experiments.manifest import (
     expand_manifest,
@@ -304,6 +308,25 @@ def test_lifecycle_resume_skips_complete_and_retries_interrupted(tmp_path) -> No
     assert states[manifest.trials[2].trial_id].reason == "not_started"
 
 
+def test_lifecycle_event_identity_rejects_payload_mutation(tmp_path) -> None:
+    trial_id = "trial-fixture"
+    path = tmp_path / "status.jsonl"
+    journal = LifecycleJournal(path, allowed_trial_ids={trial_id})
+    journal.append(
+        trial_id,
+        TrialEventType.STARTED,
+        timestamp_utc="2026-08-09T00:00:00Z",
+        artifact_path=str(tmp_path / "output"),
+        details={"plan_id": "plan-fixture"},
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["details"]["plan_id"] = "mutated-plan"
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="event_id does not bind"):
+        read_lifecycle_events(path, missing_ok=False)
+
+
 def test_preflight_and_full_agent_baseline_isolation(tmp_path) -> None:
     config = _config(tmp_path)
     manifest = expand_manifest(config)
@@ -329,6 +352,7 @@ def test_preflight_and_full_agent_baseline_isolation(tmp_path) -> None:
     for command in (baseline_command, ours_command):
         assert "--research-reset-identity-output" in command
         assert "--research-completion-output" in command
+        assert "--research-runtime-identity-output" in command
         assert command[command.index("--model") + 1] == "planner-test-model"
     assert baseline_command[baseline_command.index("--research-trial-id") + 1] == baseline.trial_id
 
@@ -349,10 +373,41 @@ def test_preflight_and_full_agent_baseline_isolation(tmp_path) -> None:
     assert plan.resolved_inner_command[
         plan.resolved_inner_command.index("--research-plan-id") + 1
     ] == plan.plan_id
+    assert plan.resolved_inner_command[
+        plan.resolved_inner_command.index("--research-manifest-id") + 1
+    ] == manifest.manifest_id
+    assert Path(
+        plan.resolved_inner_command[
+            plan.resolved_inner_command.index("--research-manifest-path") + 1
+        ]
+    ).resolve() == manifest_path.resolve()
+    for option, filename in (
+        ("--research-reset-identity-output", "reset_identity.json"),
+        ("--research-completion-output", "completion.json"),
+        ("--research-runtime-identity-output", "runtime_identity.json"),
+    ):
+        assert plan.resolved_inner_command[
+            plan.resolved_inner_command.index(option) + 1
+        ] == str(Path(plan.output_dir) / filename)
     assert "--handoff-config" not in plan.resolved_inner_command
     assert plan.env_overrides["RPENT_FULL_AGENT_PYTHON_EXECUTABLE"] == (
         plan.wrapper_command[0]
     )
+    plans_path = write_child_plans((plan,), tmp_path / "full-agent-plans.json")
+    assert load_child_plans(plans_path) == (plan,)
+    ours_plan = build_child_plan(
+        ours,
+        manifest_path=manifest_path,
+        repo_root=tmp_path,
+        python_executable="python",
+    )
+    resolved_handoff = ours_plan.resolved_inner_command[
+        ours_plan.resolved_inner_command.index("--handoff-config") + 1
+    ]
+    assert resolved_handoff == str(
+        (Path(ours.output_dir) / "resolved_handoff_runtime.json").resolve()
+    )
+    assert ours_plan.original_harness is False
     with pytest.raises(PermissionError, match="disabled by default"):
         execute_child_plan(plan)
 

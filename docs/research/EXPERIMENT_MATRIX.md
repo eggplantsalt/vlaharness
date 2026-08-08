@@ -1,8 +1,10 @@
 # Controller-Handoff Experiment Matrix
 
-> Status: implementation-complete candidate, final static audit pending;
-> server-runtime-unverified (2026-08-09). This document maps executable
-> configuration to intended comparisons. It does not report results.
+> Status (2026-08-09): static implementation and final static audit complete.
+> No test, project import, or compile check has been run. Linux
+> CUDA/MuJoCo/LIBERO runtime verification and all empirical results are absent.
+> This document maps executable configuration to intended comparisons; it does
+> not report results.
 
 ## 1. Common experimental unit
 
@@ -14,6 +16,10 @@ isolated output directory. `configuration_id` identifies the normalized launch
 document. Each `trial_id` hashes the fully resolved scientific payload rather
 than an output location. The runtime's `controller_configuration_id` hashes
 controller behavior while excluding run/output/telemetry metadata.
+
+A full-agent `trial_id` denotes exactly one execution attempt. A started,
+failed, or interrupted identity is preserved and cannot be reused for a retry;
+a retry requires a newly materialized trial identity.
 
 `reset_id_template` is deliberately `null` in the shipped matrix. A repeat
 number is not a physical reset. The live LIBERO server must report the exact
@@ -95,13 +101,13 @@ Harness trials add hidden, observational reset/completion sidecars only.
 
 ## 4. Ablations
 
-| Axis | Levels | Interpretation |
-|---|---|---|
-| Evidence | positive-only; success+failure | tests the contribution of negative outcomes without pretending method families are a perfectly isolated estimator ablation |
-| Representation | `absolute`, `target_relative`, `target_relative_visual`, `deployment_full` | deployment-allowed provenance only; future visual features are unavailable or explicitly approximated |
-| Decision | fixed, threshold, projection, online switching | separates geometry rules, competence membership, projected staging, and repeated cost comparison |
-| Uncertainty | mean; conservative bootstrap score | empirical uncertainty, not a formal safety guarantee |
-| Hierarchy | Original planner sequence; local governor | full-system comparison with the original path preserved |
+| Axis | Levels | Manifest mapping | Interpretation |
+|---|---|---|---|
+| A — Evidence | positive-only; success+failure | `ablation-evidence-positive-projection-relative` vs `ablation-evidence-outcome-projection-relative` | holds target-relative representation, projection decision, mean score, and local hierarchy fixed; estimator family necessarily differs and is reported |
+| B — Representation | `absolute`, `target_relative`, `target_relative_visual`, `deployment_full` | three `ablation-representation-*` conditions vs `controlled-ours-conservative` | deployment-allowed provenance only; future visual features are unavailable or explicitly approximated |
+| C — Decision | fixed, threshold, projection, online switching | `ablation-decision-fixed`, `ablation-decision-threshold`, `controlled-competence-projection`, `ablation-uncertainty-mean` | holds `deployment_full`, success+failure evidence, mean score, and local hierarchy fixed |
+| D — Uncertainty | mean; conservative bootstrap score | `ablation-uncertainty-mean` vs `controlled-ours-conservative` | empirical uncertainty, not a formal safety guarantee |
+| E — Hierarchy | Original planner sequence; local governor | `full-original-harness` vs `full-local-governor` | full-system comparison; method/decision differences are explicit confounders, not an isolated estimator effect |
 
 Feature configs live in `configs/research/handoff/features/`; training configs
 live in `configs/research/handoff/training/`. Environment paths are resolved and
@@ -124,6 +130,11 @@ regret only for unique candidates in an exact observed Gate-0 context matching
 run/suite/task/seed/reset/repeat/skill/controller and the configured minimum
 group size.
 
+Controlled condition comparisons are reset-matched: every compared condition
+must have exactly one record for the same task/seed/repeat and exact live
+`reset_id`. Aggregation rejects duplicate, incomplete, or nonidentical condition
+sets instead of treating them as paired evidence.
+
 Aggregation is layer- and scope-specific. One aggregate call rejects mixtures
 of Gate-0 invocation, controlled invocation, and full-agent episode records.
 Method/task tables retain execution layer, scope, condition, method, controller
@@ -133,14 +144,20 @@ factor mixtures unless the caller filters them.
 
 ## 6. Paper-oriented outputs
 
-`rpent-handoff summarize-full-agent` joins each trial's transcript, states
-trace, run-local post-reset sidecar, completion sidecar, and detailed governor
-outcomes into one episode-scoped record. Planner exceptions, reset conflicts,
+`rpent-handoff summarize-full-agent` binds the reviewed child plan and lifecycle
+journal to each trial's attempt marker, live runtime attestation, transcript,
+states trace, run-local reset/completion sidecars, direct-VLA attempt hash chain,
+and detailed governor outcomes. A terminal early failure remains an incomplete
+episode in the fixed `end_to_end_attempt_success_rate` denominator while
+`task_success` remains unavailable. Planner exceptions, reset conflicts,
 unbound outcomes, and protocol violations are not inferred away.
 
-`rpent-handoff materialize-oracle` writes outcome copies annotated with realized
-chosen cost and matched-context minimum cost. The annotations are marked
-post-hoc and policy-ineligible.
+`rpent-handoff materialize-oracle` writes Gate-0 landscape copies and, when
+`--policy-outcomes` is supplied, controlled-policy copies annotated with their
+realized chosen cost and the unique matching Gate-0 landscape minimum. Policy
+matching uses suite/task/seed/exact reset/repeat/skill/checkpoint and refuses an
+ambiguous landscape; supplying policy outcomes with zero eligible matches is an
+error. All annotations are post-hoc and policy-ineligible.
 
 `rpent-handoff aggregate` writes `results.csv`, `summary.json`,
 `per_method.csv`, `per_task.csv`, `failure_breakdown.csv`, and `calibration.csv`
@@ -156,6 +173,9 @@ filters. Both surfaces require observed inputs and never invent rows.
 - Treat staging and label failures as controller/data outcomes, not failed VLA
   training examples.
 - Treat the oracle as post-hoc evaluation only.
+- Require exact matched resets for controlled policy comparisons, and use only
+  policy-vs-Gate-0 oracle annotations produced from an unambiguous observed
+  landscape.
 - Keep `full-original-harness` free of `--handoff-config`; its planner-visible
   schemas and physical handlers remain the Original Harness path.
 - Require source revision and content-derived Pi0.5/SAM3 IDs, then verify

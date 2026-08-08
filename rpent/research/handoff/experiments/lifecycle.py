@@ -89,6 +89,23 @@ class TrialLifecycleEvent(HandoffRecord):
             raise ValueError("timestamp_utc must include a timezone")
         return value
 
+    @model_validator(mode="after")
+    def validate_event_identity(self) -> Self:
+        payload = {
+            "trial_id": self.trial_id,
+            "sequence": self.sequence,
+            "attempt": self.attempt,
+            "event": self.event.value,
+            "timestamp_utc": self.timestamp_utc,
+            "message": self.message,
+            "artifact_path": self.artifact_path,
+            "details": self.details,
+        }
+        expected = stable_identifier("event", payload)
+        if self.event_id != expected:
+            raise ValueError("event_id does not bind the lifecycle payload")
+        return self
+
 
 class TrialResumeState(HandoffRecord):
     """Derived current lifecycle state for one manifest trial."""
@@ -158,9 +175,14 @@ def read_lifecycle_events(
     events: list[TrialLifecycleEvent] = []
     seen_event_ids: set[str] = set()
     last_sequence: dict[str, int] = {}
-    with source.open("r", encoding="utf-8") as stream:
+    last_event: dict[str, TrialLifecycleEvent] = {}
+    with source.open("r", encoding="utf-8", newline="") as stream:
         for line_number, raw_line in enumerate(stream, start=1):
-            line = raw_line.strip()
+            if not raw_line.endswith("\n"):
+                raise ValueError(
+                    f"torn lifecycle line in {source} at line {line_number}"
+                )
+            line = raw_line[:-1]
             if not line:
                 raise ValueError(
                     f"blank lifecycle line in {source} at line {line_number}"
@@ -176,6 +198,10 @@ def read_lifecycle_events(
                 raise ValueError(
                     f"invalid lifecycle event in {source} at line {line_number}: {exc}"
                 ) from exc
+            if line != event.canonical_json():
+                raise ValueError(
+                    f"non-canonical lifecycle bytes in {source} at line {line_number}"
+                )
             if event.event_id in seen_event_ids:
                 raise ValueError(f"duplicate lifecycle event ID: {event.event_id}")
             expected = last_sequence.get(event.trial_id, -1) + 1
@@ -184,7 +210,19 @@ def read_lifecycle_events(
                     f"non-contiguous lifecycle sequence for {event.trial_id}: "
                     f"expected {expected}, got {event.sequence}"
                 )
+            try:
+                _validate_transition(
+                    last_event.get(event.trial_id),
+                    event=event.event,
+                    attempt=event.attempt,
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    f"invalid lifecycle transition for {event.trial_id} "
+                    f"in {source} at line {line_number}: {exc}"
+                ) from exc
             last_sequence[event.trial_id] = event.sequence
+            last_event[event.trial_id] = event
             seen_event_ids.add(event.event_id)
             events.append(event)
     return tuple(events)

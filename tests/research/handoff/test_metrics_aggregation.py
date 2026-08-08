@@ -181,7 +181,28 @@ def _record(index: int, *, success: bool, data_status: str = "observed") -> Outc
 
 
 def test_outcome_aggregation_writes_real_csv_and_json(tmp_path) -> None:
-    records = (_record(0, success=True), _record(1, success=False))
+    complete = _record(0, success=True)
+    incomplete_source = _record(1, success=False)
+    incomplete = incomplete_source.model_copy(
+        update={
+            "labels": incomplete_source.labels.model_copy(
+                update={
+                    "task_success": OutcomeSignal(
+                        value=None,
+                        source=LabelSource.UNAVAILABLE,
+                        definition="fixture incomplete official outcome",
+                    )
+                }
+            ),
+            "metadata": {
+                **incomplete_source.metadata,
+                "incomplete_execution": True,
+                "denominator_eligible": True,
+                "system_attempt_success": False,
+            },
+        }
+    )
+    records = (complete, incomplete)
     source = tmp_path / "outcomes.jsonl"
     source.write_text(
         "".join(record.canonical_json() + "\n" for record in records),
@@ -196,7 +217,11 @@ def test_outcome_aggregation_writes_real_csv_and_json(tmp_path) -> None:
     artifacts = write_aggregation(result, loaded, tmp_path / "aggregate")
 
     assert result.n_records == 2
+    assert result.schema_version == "rpent.handoff-aggregation/v2"
     assert result.overall.controller_metrics["skill_success_rate"].value == 0.5
+    assert incomplete.labels.task_success.value is None
+    assert result.overall.system_attempt_success_interval.n_observations == 2
+    assert result.overall.system_attempt_success_interval.estimate == pytest.approx(0.5)
     assert result.overall.handoff_regret.value == 0.5
     assert (tmp_path / "aggregate" / "results.csv").is_file()
     summary = json.loads((tmp_path / "aggregate" / "summary.json").read_text())

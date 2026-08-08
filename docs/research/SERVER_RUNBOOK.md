@@ -6,9 +6,12 @@ CUDA, MuJoCo, LIBERO, Pi0.5, or SAM3 in this worktree. Stop on every failed
 check. `unavailable`, `requires_diagnostic`, an identity mismatch, and a null
 required field are not passes.
 
-Run all commands from the RPent repository root. Use a new output root. Never
-reuse a trial/run ID after changing code, configuration, a model/reference
-artifact, checkpoint identity, target, sampler, or planner setting.
+Run all commands from the RPent repository root. Use a new output root that is
+outside the source checkout (preferred) or is already completely covered by
+`.gitignore`; measured outputs must not change the composite source identity.
+Never reuse a trial/run ID after changing code, configuration, a
+model/reference artifact, checkpoint identity, target, sampler, or planner
+setting.
 
 ## 0. Install, identify, and pin the runtime
 
@@ -22,7 +25,7 @@ liberopro-download-assets --skip-existing
 export PI05_CHECKPOINT_PATH=<absolute-pi05-checkpoint>
 export SAM3_CHECKPOINT_PATH=<absolute-sam3-checkpoint-or-file>
 export LIBERO_TYPE=pro
-export RPENT_HANDOFF_OUTPUT_ROOT=<absolute-new-output-root>
+export RPENT_HANDOFF_OUTPUT_ROOT=<absolute-new-output-root-outside-checkout>
 mkdir -p "$RPENT_HANDOFF_OUTPUT_ROOT"
 
 # Future artifact paths during structural preflight; immutable content
@@ -317,6 +320,8 @@ rpent-handoff run-full-agent \
 
 rpent-handoff summarize-full-agent \
   --manifest "$RPENT_HANDOFF_OUTPUT_ROOT/smoke_manifest.json" \
+  --plans "$RPENT_HANDOFF_OUTPUT_ROOT/plans/smoke_original.json" \
+  --journal "$RPENT_HANDOFF_OUTPUT_ROOT/journals/smoke_full_agent.jsonl" \
   --condition smoke-original-harness \
   --output "$RPENT_HANDOFF_OUTPUT_ROOT/smoke_original_episode.jsonl"
 ```
@@ -548,14 +553,19 @@ rpent-handoff run-full-agent \
   --capture-output --continue-on-error
 ```
 
-A retry with a transcript, states trace, reset sidecar, completion sidecar, or
-handoff outcome already present is refused; resume only untouched/interrupted
-trial outputs. Then create episode-scoped summaries. The run-local post-reset
-sidecar is definitive; detached probes are expectation cross-checks.
+One full-agent `trial_id` is one execution attempt. Once its lifecycle has a
+`started` event, it is never retried under that ID: preserve interrupted/failed
+evidence and generate a new manifest/trial identity for a retry. `--resume` may
+therefore select only never-started trials. Then create episode-scoped summaries.
+The reviewed plan, lifecycle journal, attempt marker, live runtime attestation,
+and run-local post-reset sidecar are authoritative; detached probes are
+expectation cross-checks.
 
 ```bash
 rpent-handoff summarize-full-agent \
   --manifest "$RPENT_HANDOFF_OUTPUT_ROOT/experiment_manifest.json" \
+  --plans "$RPENT_HANDOFF_OUTPUT_ROOT/plans/full_agent_main.json" \
+  --journal "$RPENT_HANDOFF_OUTPUT_ROOT/journals/full_agent_all.jsonl" \
   "${FULL_MAIN[@]}" \
   --runtime-probe "$RPENT_RUNTIME_PROBE_READONLY" \
   --output "$RPENT_HANDOFF_OUTPUT_ROOT/full_agent_episode_summaries.jsonl"
@@ -563,7 +573,10 @@ rpent-handoff summarize-full-agent \
 
 Planner errors, missing finishes, direct-tool errors, detailed governor
 failures, unknown counts, exact reset contradictions, and protocol violations
-remain explicit. Episode summaries are excluded from model training.
+remain explicit. A lifecycle-terminal early failure is emitted as an incomplete
+episode and remains in the fixed denominator of
+`end_to_end_attempt_success_rate`; its `task_success` stays unavailable rather
+than being imputed false. Episode summaries are excluded from model training.
 
 ## 8. Ablations
 
@@ -744,8 +757,11 @@ plots. Missing telemetry stays null; never replace it with zero.
   main method wins, or that residual novelty survives peer review.
 
 Archive matrix and Gate-0 jobs, the exact source identity, checkpoint digest
-procedure/output, manifests and child plans, resolved runtime configs, run-local
-reset/completion sidecars, raw positive and negative outcome shards, privileged
-setup labels in their separate namespace, model/reference manifests and bytes,
-split assignments, lifecycle journals, probe reports, aggregate JSON/CSV, plots,
-and all service/child logs.
+procedure/output, manifests and reviewed child-plan files, resolved runtime
+configs, lifecycle journals, each full-agent `attempt.json`,
+`runtime_identity.json`, `reset_identity.json`, `completion.json`, and
+`direct_vla_attempts.jsonl`, raw positive and negative outcome shards,
+privileged setup labels in their separate namespace, model/reference manifests
+and bytes, split assignments, probe reports, aggregate JSON/CSV, plots, and all
+service/child logs. Preserve incomplete and error artifacts as evidence; do not
+collapse them into a successful-only archive.

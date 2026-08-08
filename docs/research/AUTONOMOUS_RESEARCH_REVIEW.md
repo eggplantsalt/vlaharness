@@ -3,7 +3,8 @@
 > 审查日期：2026-08-09。本文记录实现后的研究判断，不是实验结果。
 > “实现事实”来自当前 checkout 的静态检查；“文献事实”来自所列原始论文；
 > “研究假设”和“待验证”均不得写成 established finding。Windows 阶段按任务约束
-> 未运行 pytest、导入冒烟、模拟器、GPU、Gate-0 或模型推理。
+> 未运行任何测试、项目导入、编译检查、模拟器、GPU、Gate-0 或模型推理。当前仅是
+> 静态实现候选；Linux CUDA/MuJoCo runtime 与全部实证结果仍未验证/缺失。
 
 ## A. 当前设计的双视角批判
 
@@ -63,9 +64,10 @@ gradient”必须先由 Gate-0 证明。
 - Problem-Reality：**PASS（形式保证缺口真实）**。现有 bootstrap/quantile 分数没有
   finite-sample 风险保证。
 - Novelty：**FAIL**。[Conformal Decision Theory](https://arxiv.org/abs/2310.05921)
+  （arXiv 首次提交 2023-10-09，修订 2024-05-02）
   已将“信任 nominal policy 或切换到 safe backup”作为直接应用；
-  [Conformal Policy Learning](https://arxiv.org/abs/2311.01457) 更直接地在多个 base
-  policy 间用 conformal quantile 切换并给出保证。
+  [Conformal Policy Learning](https://arxiv.org/abs/2311.01457)（arXiv 首次提交
+  2023-11-02）更直接地在多个 base policy 间用 conformal quantile 切换并给出保证。
 - 决定：不新增为 Phase B 主机制。若真实 calibration/risk-coverage 失败，可作为
   有明确既有来源的 baseline/extension，不能重新包装为核心新意。
 
@@ -75,8 +77,9 @@ gradient”必须先由 Gate-0 证明。
   有价值，但当前服务器 probe 和 Gate-0 尚未证明它是主要失败源。
 - Novelty：**FAIL / scope 风险高**。主动改变视角获取 manipulation-relevant 信息是
   成熟方向；例如 [Active Perception and Representation for Robotic Manipulation](https://arxiv.org/abs/2003.06734)
-  已用视角变化服务定位和操作，[Real-World Reinforcement Learning of Active
-  Perception Behaviors](https://arxiv.org/abs/2512.01188) 在真实操作中学习信息收集。
+  （arXiv 首次提交 2020-03-15）已用视角变化服务定位和操作，
+  [Real-World Reinforcement Learning of Active Perception Behaviors](https://arxiv.org/abs/2512.01188)
+  （NeurIPS 2025；arXiv 首次提交 2025-12-01）在真实操作中学习信息收集。
 - 决定：不引入额外 observation dynamics、world model 或 active-perception policy。
 
 ### 3. Causal / off-policy counterfactual handoff value
@@ -94,10 +97,11 @@ gradient”必须先由 Gate-0 证明。
 - Problem-Reality：**UNCERTAIN**。解析 servo 是否覆盖不足要等真实 staging
   failure/碰撞证据，不能因更复杂方法存在就假定问题成立。
 - Novelty：**FAIL**。[Learning Setup Policies](https://arxiv.org/abs/2101.09391)
-  已学习连接预训练 controller 的 setup policy；[Training Transition Policies via
-  Distribution Matching](https://arxiv.org/abs/2110.04357) 用 stay/switch 与后续任务
-  成败学习 transition；[Hybrid Systems Neural Control with Region-of-Attraction
-  Planner](https://proceedings.mlr.press/v211/meng23a.html) 学习跨 mode RoA 并规划。
+  （arXiv 首次提交 2021-01-23；RA-L 2022-10）已学习连接预训练 controller 的 setup
+  policy；[Training Transition Policies via Distribution Matching](https://arxiv.org/abs/2110.04357)
+  （arXiv 首次提交 2021-10-08，修订 2022-03-11）用 stay/switch 与后续任务成败学习
+  transition；[Hybrid Systems Neural Control with Region-of-Attraction Planner](https://proceedings.mlr.press/v211/meng23a.html)
+  （PMLR 2023）学习跨 mode RoA 并规划。
 - 决定：不把“简单解析 staging + 冻结 VLA”扩大成新控制器学习项目。
 
 ### 5. Multi-step world model / POMDP optimal stopping
@@ -120,10 +124,16 @@ speculative research policy/config**，也没有用更复杂模块制造产出�
 
 - planner-visible `pi0_pick`/`pi0_doubled` schema 不变；opt-in 时仅透明替换内部
   handler，disabled 时保持 Original Harness handler；
-- 正常 CLI 不变；研究 child 另外生成原子、排他的 run-local post-reset identity
-  与 completion sidecar，保留 planner exception；
-- full-agent summary 严格绑定 transcript、states、sidecars、planner identity、source
-  revision、controller identity 和详细 outcome；游离/重复/矛盾记录 fail closed；
+- 正常 CLI 不变；研究 child 绑定 reviewed child plan，并在真实进程执行前写
+  `attempt.json`，在 reset/action 前写 live `runtime_identity.json`，随后保留
+  `reset_identity.json`、`completion.json` 与 planner exception；
+- planner-visible direct-VLA 调用写入 fsync、hash-chained `direct_vla_attempts.jsonl`；
+  `started` 先于 handler，terminal 缺失仍表示真实发生过的中断尝试；
+- full-agent summary 严格绑定 plan、lifecycle journal、attempt/runtime/reset/completion、
+  direct-VLA journal、transcript、states、planner/source/controller identity 和详细
+  outcome；游离/重复/矛盾记录 fail closed；
+- 一个 full-agent `trial_id` 只允许一次 lifecycle attempt；早期 terminal failure 进入
+  `end_to_end_attempt_success_rate` 固定分母，但不可观测的 `task_success` 保持 unavailable；
 - stable outcome key 只绑定 invocation identity，使同一调用的矛盾重试必然碰撞；
 - Gate-0 `candidate_id` 与 repeat 无关，`sample_id` 绑定一次执行；resume 不截断
   torn tail，也不接受不一致的 trial/sample/reset/controller；
@@ -153,24 +163,27 @@ speculative research policy/config**，也没有用更复杂模块制造产出�
 state。
 
 **问题已有依据但尚未被证明。** [Harness VLA](https://arxiv.org/abs/2607.08448)
-本身把 frozen VLA 暴露为可重试 primitive，并由 agent 进行解析 staging/restaging；
+（arXiv 首次提交 2026-07-09，修订 2026-07-15）本身把 frozen VLA 暴露为可重试
+primitive，并由 agent 进行解析 staging/restaging；
 这说明系统存在调用条件与 operating-range 问题，但不证明连续局部 governor 优于
 planner heuristic。
 
 **最强近邻和实质重叠：**
 
-- [Learning When to Switch](https://arxiv.org/abs/2011.00440) 为目标 controller
-  学习成功切换概率并选择 switch region，已覆盖“continuous state + learned
-  success estimator + threshold switching”；
+- [Learning When to Switch](https://arxiv.org/abs/2011.00440)（arXiv 首次提交
+  2020-11-01；IROS 2021）为目标 controller 学习成功切换概率并选择 switch region，
+  已覆盖“continuous state + learned success estimator + threshold switching”；
 - [Hierarchical Policies for Cluttered-Scene Grasping with Latent Plans](https://arxiv.org/abs/2107.01518)
-  用 option classifier 判断切到预训练 grasp policy 是否会成功；
+  （arXiv 首次提交 2021-07-04，修订 2022-01-11）用 option classifier 判断切到预训练
+  grasp policy 是否会成功；
 - [Training Transition Policies via Distribution Matching](https://arxiv.org/abs/2110.04357)
-  直接使用后继 pretrained policy 的真实任务成败训练 stay/switch；
-- [Where To Start?](https://proceedings.mlr.press/v205/vosylius23a.html) 学习技能从
-  某配置开始能否成功/无碰撞，并优化起始配置后再运动规划过去，与 competence
-  projection/start-state optimization 非常接近；
+  （arXiv 首次提交 2021-10-08，修订 2022-03-11）直接使用后继 pretrained policy
+  的真实任务成败训练 stay/switch；
+- [Where To Start?](https://proceedings.mlr.press/v205/vosylius23a.html)（PMLR 2023）
+  学习技能从某配置开始能否成功/无碰撞，并优化起始配置后再运动规划过去，与
+  competence projection/start-state optimization 非常接近；
 - [Relational Learning for Skill Preconditions](https://proceedings.mlr.press/v155/sharma21b.html)
-  已覆盖 manipulation skill precondition learning。
+  （PMLR 2021）已覆盖 manipulation skill precondition learning。
 
 **可能的窄差异：**
 
@@ -207,6 +220,7 @@ perception/label artifact。
 6. 若透明路由、checkpoint identity、reset identity、source/artifact identity 或 label
    定义任一未通过，则该 trial 不进入论文比较。
 
-最终结论：**Phase B 没有找到一个比当前方案更强、同时现实且有清晰 residual
-novelty 的新研究机制。** 下一步是严格按 Linux runbook 获取真实证据，再决定这条
-主线是否值得形成论文方法；当前文档不声称任何经验优势。
+最终结论：**Phase B 没有保留 speculative new mechanism，也没有找到一个比当前
+方案更强、同时现实且有清晰 residual novelty 的新研究机制；Novelty 仍为
+UNCERTAIN。** 下一步是严格按 Linux runbook 获取真实证据，再决定这条主线是否值得
+形成论文方法；当前文档不声称任何经验优势。

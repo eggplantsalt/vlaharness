@@ -240,16 +240,16 @@ def write_runtime_attestation(
 ) -> Path:
     """Persist once; an identical existing attestation is idempotent."""
     destination = Path(path).expanduser().resolve()
-    canonical = attestation.canonical_json() + "\n"
+    canonical = (attestation.canonical_json() + "\n").encode("utf-8")
     if destination.exists():
-        existing = destination.read_text(encoding="utf-8")
+        existing = destination.read_bytes()
         if existing != canonical:
             raise FileExistsError(
                 f"runtime attestation already exists with different content: {destination}"
             )
         return destination
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("x", encoding="utf-8", newline="\n") as stream:
+    with destination.open("xb") as stream:
         stream.write(canonical)
         stream.flush()
         os.fsync(stream.fileno())

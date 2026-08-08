@@ -38,8 +38,8 @@ from robots.libero.handoff_runtime import (
 )
 from rpent.research.handoff.dataset import (
     DatasetResearchSink,
-    OutcomeDataset,
     scan_decision_jsonl,
+    scan_outcome_jsonl,
 )
 from rpent.research.handoff.experiments.config import RuntimeConfig, load_strict_json
 from rpent.research.handoff.experiments.gate0 import (
@@ -734,16 +734,27 @@ def run_gate0_server(
         outcome_path = record_dir / "outcomes.jsonl"
         existing_outcomes = ()
         if outcome_path.exists() and outcome_path.stat().st_size:
-            existing_outcomes = OutcomeDataset.from_jsonl(
+            outcome_scan = scan_outcome_jsonl(
                 outcome_path,
                 allow_partial_final_line=False,
-            ).records
+            )
+            if outcome_scan.needs_trailing_newline:
+                raise ValueError(
+                    "legacy Gate-0 outcome shard lacks a trailing newline"
+                )
+            existing_outcomes = tuple(
+                envelope.payload for envelope in outcome_scan.envelopes
+            )
         decision_path = record_dir / "decisions.jsonl"
         if decision_path.exists() and decision_path.stat().st_size:
-            scan_decision_jsonl(
+            decision_scan = scan_decision_jsonl(
                 decision_path,
                 allow_partial_final_line=False,
             )
+            if decision_scan.needs_trailing_newline:
+                raise ValueError(
+                    "legacy Gate-0 decision shard lacks a trailing newline"
+                )
         dataset_sink = DatasetResearchSink(record_dir, fsync=config.fsync)
         telemetry_sink = RuntimeEventSink(
             output_dir / "telemetry",

@@ -27,7 +27,7 @@ from rpent.research.handoff.evaluation.statistics import (
 )
 from rpent.research.handoff.types import HandoffRecord, OutcomeRecord
 
-AGGREGATION_SCHEMA_VERSION = "rpent.handoff-aggregation/v1"
+AGGREGATION_SCHEMA_VERSION = "rpent.handoff-aggregation/v2"
 
 
 class AggregateGroup(HandoffRecord):
@@ -38,6 +38,7 @@ class AggregateGroup(HandoffRecord):
     controller_metrics: dict[str, MetricValue]
     system_metrics: dict[str, MetricValue]
     target_success_interval: BootstrapInterval
+    system_attempt_success_interval: BootstrapInterval
     predictive_metrics: BinaryEvaluation | None = None
     predictive_unavailable_reason: str | None = None
     handoff_regret: MetricValue
@@ -206,6 +207,11 @@ def outcome_to_tidy_row(record: OutcomeRecord) -> dict[str, Any]:
         "execution_layer": execution_layer,
         "record_scope": record_scope,
         "protocol_adherent": record.metadata.get("protocol_adherent"),
+        "incomplete_execution": record.metadata.get("incomplete_execution"),
+        "denominator_eligible": record.metadata.get("denominator_eligible"),
+        "system_attempt_success": record.metadata.get(
+            "system_attempt_success"
+        ),
         "checkpoint_id": record.controller.checkpoint_id,
         "skill": record.skill.name,
         "semantic_target": record.skill.semantic_target,
@@ -260,6 +266,9 @@ def outcome_to_tidy_row(record: OutcomeRecord) -> dict[str, Any]:
         "decision_mode": record.metadata.get("decision_mode"),
         "uncertainty_mode": record.metadata.get("uncertainty_mode"),
         "hierarchy_mode": record.metadata.get("hierarchy_mode"),
+        "analysis_configuration_id": record.metadata.get(
+            "analysis_configuration_id"
+        ),
         "data_status": _data_status(record),
     }
     if state is not None and target_position is not None:
@@ -368,6 +377,50 @@ def _success_interval(
     )
 
 
+def _system_attempt_success_interval(
+    records: Sequence[OutcomeRecord],
+    *,
+    iterations: int,
+    seed: int,
+) -> BootstrapInterval:
+    """Fixed-denominator CI for complete and terminal-incomplete attempts."""
+    values: list[bool] = []
+    groups: list[str] = []
+    for record in records:
+        marker = record.metadata.get("system_attempt_success")
+        if marker is None:
+            if record.metadata.get("denominator_eligible") is True:
+                raise ValueError(
+                    "denominator-eligible record lacks system_attempt_success: "
+                    f"{record.record_id}"
+                )
+            marker = record.labels.task_success.value
+        if marker is None:
+            continue
+        if not isinstance(marker, bool):
+            raise ValueError(
+                f"system_attempt_success must be boolean: {record.record_id}"
+            )
+        values.append(marker)
+        groups.append(
+            "|".join(
+                (
+                    record.identity.suite,
+                    str(record.identity.task_id),
+                    record.identity.reset_id
+                    or record.identity.episode_id
+                    or record.identity.trial_id,
+                )
+            )
+        )
+    return grouped_bootstrap_interval(
+        values,
+        groups,
+        iterations=iterations,
+        seed=seed,
+    )
+
+
 def _aggregate_group(
     records: Sequence[OutcomeRecord],
     group: dict[str, str | int],
@@ -401,6 +454,11 @@ def _aggregate_group(
             iterations=bootstrap_iterations,
             seed=bootstrap_seed,
         ),
+        system_attempt_success_interval=_system_attempt_success_interval(
+            records,
+            iterations=bootstrap_iterations,
+            seed=bootstrap_seed,
+        ),
         predictive_metrics=predictive,
         predictive_unavailable_reason=predictive_reason,
         handoff_regret=regret,
@@ -421,7 +479,11 @@ def _group_records(
             if key == "method":
                 values.append(record.controller.method)
             elif key == "configuration_id":
-                values.append(record.controller.configuration_id)
+                value = record.metadata.get(
+                    "analysis_configuration_id",
+                    record.controller.configuration_id,
+                )
+                values.append(str(value))
             elif key == "execution_layer":
                 value = record.metadata.get("execution_layer", "unspecified")
                 values.append(str(value))
@@ -659,6 +721,18 @@ def _aggregate_group_row(group: AggregateGroup) -> dict[str, Any]:
             "target_success_ci.lower": group.target_success_interval.lower,
             "target_success_ci.upper": group.target_success_interval.upper,
             "target_success_ci.n_groups": group.target_success_interval.n_groups,
+            "system_attempt_success_ci.estimate": (
+                group.system_attempt_success_interval.estimate
+            ),
+            "system_attempt_success_ci.lower": (
+                group.system_attempt_success_interval.lower
+            ),
+            "system_attempt_success_ci.upper": (
+                group.system_attempt_success_interval.upper
+            ),
+            "system_attempt_success_ci.n_groups": (
+                group.system_attempt_success_interval.n_groups
+            ),
             "handoff_regret": group.handoff_regret.value,
             "handoff_regret.reason": group.handoff_regret.reason,
         }
