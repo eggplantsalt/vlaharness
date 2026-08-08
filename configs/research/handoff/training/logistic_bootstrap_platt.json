@@ -1,0 +1,23 @@
+{
+  "target_label": "primitive_success",
+  "estimator_kind": "logistic",
+  "calibration_method": "platt",
+  "bootstrap_ensemble_size": 20,
+  "uncertainty_beta": 1.0,
+  "lower_quantile": 0.1,
+  "upper_quantile": 0.9,
+  "random_state": 20260808,
+  "max_iter": 1000,
+  "split": {
+    "schema_version": "rpent.handoff-group-split/v1",
+    "train_fraction": 0.7,
+    "calibration_fraction": 0.15,
+    "test_fraction": 0.15,
+    "seed": 20260808,
+    "constraints": [
+      {"name": "episode", "fields": ["identity.run_id", "identity.episode_id"], "allow_missing": false},
+      {"name": "reset", "fields": ["identity.suite", "identity.task_id", "identity.reset_id"], "allow_missing": false},
+      {"name": "candidate", "fields": ["identity.suite", "identity.task_id", "identity.candidate_id"], "allow_missing": false}
+    ]
+  }
+}

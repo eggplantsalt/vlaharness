@@ -53,6 +53,33 @@ class VLAClient:
     def healthz(self, *, timeout_s: float | None = None) -> dict[str, Any]:
         return self._client.call("healthz", timeout_s=timeout_s)
 
+    def runtime_probe(
+        self,
+        env_obs: dict[str, Any] | None = None,
+        *,
+        mode: str = "eval",
+    ) -> dict[str, Any]:
+        """Return VLA server metadata and optionally probe real action shape.
+
+        Passing ``env_obs`` performs one model inference but never sends the
+        resulting actions to the environment.  This keeps the potentially
+        expensive/destructive check explicit and outside normal health checks.
+        """
+
+        payload = self._client.call("vla.runtime_probe")
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"invalid VLA runtime probe response: {payload!r}")
+        result = dict(payload)
+        if env_obs is not None:
+            actions, _ = self.predict_action_batch(env_obs, mode=mode)
+            result["inference_probe"] = {
+                "action_shape": list(actions.shape),
+                "action_dtype": str(actions.dtype),
+                "finite": bool(np.isfinite(actions).all()),
+                "executed_in_environment": False,
+            }
+        return result
+
     def predict_action_batch(
         self,
         env_obs: dict[str, Any],

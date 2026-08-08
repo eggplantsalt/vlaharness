@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import os
+import platform
 import sys
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -87,15 +90,28 @@ def build_env_cfg(
     return cfg
 
 
-def make_env(task_id: int, seed: int, suite_name: str = "libero_spatial",
-             max_episode_steps: int = 10000) -> LiberoEnv:
-    """Build a single-env LiberoEnv pinned to ``task_id`` / ``seed``."""
-    from rlinf.envs.libero.libero_env import LiberoEnv
+def resolve_reset_id(task_id: int, seed: int, suite_name: str) -> tuple[int, int]:
+    """Return the exact global reset id and task-local trial count."""
     from rlinf.envs.libero.utils import benchmark as _bench_mod
+
     suite = _bench_mod.get_benchmark(suite_name)()
     first_id = sum(len(suite.get_task_init_states(t)) for t in range(task_id))
     trials = len(suite.get_task_init_states(task_id))
-    rid = first_id + (seed % trials)
+    if trials <= 0:
+        raise RuntimeError(
+            f"LIBERO task has no initialization states: {suite_name} task {task_id}"
+        )
+    return first_id + (seed % trials), trials
+
+
+def make_env(task_id: int, seed: int, suite_name: str = "libero_spatial",
+             max_episode_steps: int = 10000,
+             *, specific_reset_id: int | None = None) -> LiberoEnv:
+    """Build a single-env LiberoEnv pinned to ``task_id`` / ``seed``."""
+    from rlinf.envs.libero.libero_env import LiberoEnv
+    rid = specific_reset_id
+    if rid is None:
+        rid, _ = resolve_reset_id(task_id, seed, suite_name)
     cfg = build_env_cfg(
         task_suite_name=suite_name,
         specific_reset_id=rid,
@@ -127,6 +143,55 @@ def _to_numpy_tree(x):
     return x
 
 
+def _array_descriptor(value: Any) -> dict[str, Any]:
+    """Describe an observation field without returning privileged values."""
+    if value is None:
+        return {"available": False}
+    try:
+        array = np.asarray(value)
+    except Exception:
+        return {"available": True, "type": type(value).__name__}
+    return {
+        "available": True,
+        "shape": list(array.shape),
+        "dtype": str(array.dtype),
+    }
+
+
+def _package_versions(names: tuple[str, ...]) -> dict[str, str | None]:
+    versions: dict[str, str | None] = {}
+    for name in names:
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def _cuda_runtime_info() -> dict[str, Any]:
+    try:
+        import torch
+
+        available = bool(torch.cuda.is_available())
+        result: dict[str, Any] = {
+            "available": available,
+            "device_count": int(torch.cuda.device_count()) if available else 0,
+        }
+        if available:
+            device = int(torch.cuda.current_device())
+            result.update(
+                {
+                    "current_device": device,
+                    "device_name": torch.cuda.get_device_name(device),
+                    "memory_allocated_bytes": int(torch.cuda.memory_allocated(device)),
+                    "memory_reserved_bytes": int(torch.cuda.memory_reserved(device)),
+                }
+            )
+        return result
+    except Exception as exc:
+        return {"available": False, "error": str(exc)}
+
+
 class LiberoEnvFacade(RpcFacade):
     """Implements :class:`robots.libero.env_client.LiberoEnvClient`
     over :class:`rlinf.envs.libero.libero_env.LiberoEnv`.
@@ -136,7 +201,13 @@ class LiberoEnvFacade(RpcFacade):
     trip.
     """
 
-    def __init__(self, env: LiberoEnv, *, meta: dict):
+    def __init__(
+        self,
+        env: LiberoEnv,
+        *,
+        meta: dict,
+        runtime_meta: dict[str, Any] | None = None,
+    ):
         super().__init__()
         self._env = env
         self._env_idx = 0
@@ -145,6 +216,10 @@ class LiberoEnvFacade(RpcFacade):
         # client compares against its own expected values at construction
         # and refuses to talk to a stale or mis-configured server.
         self._meta = dict(meta)
+        # Probe-only information is kept separate so the existing strict
+        # get_env_meta equality contract remains byte-for-byte compatible.
+        self._runtime_meta = dict(runtime_meta or {})
+        self._last_obs: dict[str, Any] | None = None
 
     def _dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
         if method.startswith("env."):
@@ -193,6 +268,7 @@ class LiberoEnvFacade(RpcFacade):
     def reset(self):
         obs, info = self._env.reset()
         obs = self._strip_obs(_to_numpy_tree(obs))
+        self._last_obs = obs
         self._done = False
         return obs, _to_numpy_tree(info)
 
@@ -200,6 +276,7 @@ class LiberoEnvFacade(RpcFacade):
         assert not self._done, "step called after episode done"
         obs, rew, term, trunc, info = self._env.step(self._expand_action(action))
         obs = self._strip_obs(_to_numpy_tree(obs))
+        self._last_obs = obs
         term = self._strip(_to_numpy_tree(term))
         trunc = self._strip(_to_numpy_tree(trunc))
         self._record_done(term, trunc)
@@ -228,6 +305,7 @@ class LiberoEnvFacade(RpcFacade):
             self._expand_chunk(actions)
         )
         obs_list = [self._strip_obs(_to_numpy_tree(o)) for o in obs_list]
+        self._last_obs = obs_list[-1]
         term = self._strip(_to_numpy_tree(term))
         trunc = self._strip(_to_numpy_tree(trunc))
         self._record_done(term, trunc)
@@ -246,6 +324,84 @@ class LiberoEnvFacade(RpcFacade):
     def get_env_meta(self) -> dict:
         """Return the meta info this server was launched with. """
         return dict(self._meta)
+
+    def runtime_probe(self) -> dict[str, Any]:
+        """Describe the live runtime without exposing raw object coordinates."""
+        raw = _to_numpy_tree(self._env.current_raw_obs[self._env_idx])
+        policy_obs = self._last_obs or {}
+        raw_mapping = raw if isinstance(raw, Mapping) else {}
+        policy_mapping = policy_obs if isinstance(policy_obs, Mapping) else {}
+        raw_fields = {
+            str(key): _array_descriptor(value)
+            for key, value in sorted(
+                raw_mapping.items(), key=lambda item: str(item[0])
+            )
+        }
+        policy_fields = {
+            str(key): _array_descriptor(value)
+            for key, value in sorted(
+                policy_mapping.items(), key=lambda item: str(item[0])
+            )
+        }
+        state_value = policy_mapping.get("states")
+        state_sample = None
+        state_sample_error = None
+        if state_value is not None:
+            try:
+                state_array = np.asarray(state_value, dtype=np.float64)
+                if state_array.ndim != 1:
+                    state_sample_error = (
+                        f"expected one-dimensional state, got {state_array.shape}"
+                    )
+                elif not np.isfinite(state_array).all():
+                    state_sample_error = "state contains NaN/Inf"
+                else:
+                    state_sample = [float(value) for value in state_array]
+            except Exception as exc:
+                state_sample_error = f"state is not numeric: {type(exc).__name__}: {exc}"
+        return {
+            "schema_version": "rpent.runtime-probe/v1",
+            "component": "libero_env",
+            "python": platform.python_version(),
+            "packages": _package_versions(
+                (
+                    "rpent-rlinf",
+                    "rlinf-libero",
+                    "rpent-liberopro",
+                    "rlinf-liberoplus",
+                    "mujoco",
+                    "robosuite",
+                    "torch",
+                    "omegaconf",
+                )
+            ),
+            "server_meta": dict(self._meta),
+            "runtime_meta": dict(self._runtime_meta),
+            "environment_class": (
+                f"{type(self._env).__module__}.{type(self._env).__qualname__}"
+            ),
+            "policy_observation_fields": policy_fields,
+            "raw_observation_fields": raw_fields,
+            "raw_observation_type": type(raw).__name__,
+            "state_sample": state_sample,
+            "state_sample_error": state_sample_error,
+            "state_sample_provenance": (
+                "experiment_only_runtime_diagnostic; not a policy feature source"
+                if state_sample is not None
+                else None
+            ),
+            "episode_done": bool(self._done),
+            "cuda": _cuda_runtime_info(),
+        }
+
+    def diagnostic_chunk_step(self, actions):
+        """Return all external chunk frames/flags for a destructive diagnostic.
+
+        The external environment exposes no source-verified executed-step
+        counter here, so callers must not interpret padded/repeated frames as
+        proof that physics continued after the first done signal.
+        """
+        return self.chunk_step(actions, return_all_frames=True)
 
     def render_camera(
         self,
@@ -331,8 +487,20 @@ def main():
         import torch
         torch.cuda.set_device(args.cuda_device)
 
-    raw_env = make_env(args.task, args.seed, suite_name=args.suite,
-                       max_episode_steps=args.max_episode_steps)
+    reset_id, reset_trials = resolve_reset_id(args.task, args.seed, args.suite)
+    raw_env = make_env(
+        args.task,
+        args.seed,
+        suite_name=args.suite,
+        max_episode_steps=args.max_episode_steps,
+        specific_reset_id=reset_id,
+    )
+    env_cfg = build_env_cfg(
+        task_suite_name=args.suite,
+        specific_reset_id=reset_id,
+        seed=args.seed,
+        max_episode_steps=args.max_episode_steps,
+    )
     facade = LiberoEnvFacade(
         raw_env,
         meta={
@@ -340,6 +508,14 @@ def main():
             "task": args.task,
             "seed": args.seed,
             "max_episode_steps": args.max_episode_steps,
+        },
+        runtime_meta={
+            "libero_type": os.environ.get("LIBERO_TYPE"),
+            "reset_id": reset_id,
+            "task_init_state_count": reset_trials,
+            "env_config": OmegaConf.to_container(env_cfg, resolve=True),
+            "mujoco_gl": os.environ.get("MUJOCO_GL"),
+            "pyopengl_platform": os.environ.get("PYOPENGL_PLATFORM"),
         },
     )
     facade.serve(transport=args.transport, host=args.host, port=args.port,

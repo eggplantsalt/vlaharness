@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import importlib.metadata
 import io
 import os
+import platform
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -127,6 +130,8 @@ class VLAFacade(RpcFacade):
         from rlinf.models.embodiment.openpi import get_model as get_openpi_model
 
         cfg = build_model_cfg(model_path=model_path)
+        self._model_path = str(Path(model_path).expanduser().resolve())
+        self._model_cfg = cfg
         t0 = time.time()
         logger.info("loading Pi0.5 (model_path=%s) ...", cfg["model_path"])
         self._model = get_openpi_model(cfg, torch_dtype=None).cuda().eval()
@@ -135,6 +140,8 @@ class VLAFacade(RpcFacade):
     def _dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
         if method == "predict":
             return self.predict(*args, **kwargs)
+        if method in {"vla.runtime_probe", "runtime_probe"}:
+            return self.runtime_probe()
         raise ValueError(f"unknown RPC method: {method!r}")
 
     def predict(self, instruction: str, images: dict[str, Any], state: list,
@@ -151,6 +158,66 @@ class VLAFacade(RpcFacade):
             "actions": actions_np.tolist(),
             "shape": list(actions_np.shape),
             "dtype": "float32",
+        }
+
+    def runtime_probe(self) -> dict[str, Any]:
+        """Return checkpoint/config/device metadata without running inference."""
+        path = Path(self._model_path)
+        checkpoint_stat: dict[str, Any] = {
+            "path": self._model_path,
+            "exists": path.exists(),
+            "is_file": path.is_file(),
+            "is_dir": path.is_dir(),
+        }
+        if path.exists():
+            stat = path.stat()
+            checkpoint_stat.update(
+                {
+                    "size_bytes": int(stat.st_size) if path.is_file() else None,
+                    "mtime_ns": int(stat.st_mtime_ns),
+                }
+            )
+        packages: dict[str, str | None] = {}
+        for name in ("rpent-rlinf", "rlinf-openpi", "torch", "omegaconf"):
+            try:
+                packages[name] = importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                packages[name] = None
+        cuda: dict[str, Any] = {
+            "available": bool(torch.cuda.is_available()),
+            "device_count": int(torch.cuda.device_count()),
+        }
+        if torch.cuda.is_available():
+            device = int(torch.cuda.current_device())
+            cuda.update(
+                {
+                    "current_device": device,
+                    "device_name": torch.cuda.get_device_name(device),
+                    "memory_allocated_bytes": int(torch.cuda.memory_allocated(device)),
+                    "memory_reserved_bytes": int(torch.cuda.memory_reserved(device)),
+                }
+            )
+        return {
+            "schema_version": "rpent.runtime-probe/v1",
+            "component": "pi0.5_vla",
+            "python": platform.python_version(),
+            "packages": packages,
+            "checkpoint": checkpoint_stat,
+            "model_class": (
+                f"{type(self._model).__module__}.{type(self._model).__qualname__}"
+            ),
+            "model_config": OmegaConf.to_container(self._model_cfg, resolve=True),
+            "cuda": cuda,
+            "configured_action_shape": {
+                "batch": 1,
+                "chunk": int(self._model_cfg["num_action_chunks"]),
+                "action_dim": int(self._model_cfg["action_dim"]),
+            },
+            "actual_action_shape": None,
+            "actual_action_shape_note": (
+                "Call VLAClient.runtime_probe(env_obs=...) for a non-executed "
+                "real inference shape check."
+            ),
         }
 
 

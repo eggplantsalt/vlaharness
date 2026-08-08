@@ -1,0 +1,18 @@
+{
+  "schema_version": "rpent.libero-handoff-runtime/v1",
+  "enabled": true,
+  "core": {
+    "governor": {"max_analytic_steps": 20, "max_staging_distance_m": 0.3, "max_local_time_s": 30.0, "max_step_distance_m": 0.025, "max_target_age_s": 2.0, "fallback_mode": "force_handoff", "budget_fallback_mode": "force_handoff", "propagate_cancellation": true},
+    "candidate_generator": {"approach_axis_world": [0.0, 0.0, 1.0], "standoff_distances_m": [0.04, 0.08, 0.12], "xyz_perturbations_m": [[0.0, 0.0, 0.0], [0.02, 0.0, 0.0], [-0.02, 0.0, 0.0], [0.0, 0.02, 0.0], [0.0, -0.02, 0.0]], "wrist_yaw_offsets_rad": [-0.25, 0.0, 0.25], "wrist_pitch_offsets_rad": [-0.15, 0.0, 0.15], "workspace_min_m": [-1.0, -1.0, 0.0], "workspace_max_m": [1.0, 1.0, 2.0], "max_candidates": 160},
+    "feature_spec": {"preset": "target_relative", "skill_vocabulary": ["pick", "contact"]},
+    "policy": {"name": "positive_nearest_success", "positive_references_file": "${RPENT_HANDOFF_POSITIVE_REFERENCES}", "handoff_radius": 0.03}
+  },
+  "target_provider": {"kind": "perception", "camera": "agentview", "min_score": 0.2, "provider_version": "rpent-current-rgbd-sam3/v1"},
+  "tool_defaults": {"handoff_pi0_pick": {"stage_gripper": -1.0, "action_scale": 0.05, "stage_tolerance_m": 0.000001}},
+  "instrumentation": true,
+  "output_subdir": "handoff",
+  "oracle_ablation": false,
+  "controller_method": "positive_nearest_success",
+  "controller_implementation_version": "rpent-libero-handoff/v1",
+  "metadata": {"condition": "positive_retrieval", "evidence": "success_only"}
+}

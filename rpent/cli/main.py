@@ -21,7 +21,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import queue
 import shlex
 import sys
@@ -273,6 +275,61 @@ def main() -> int:
     }
     with open(transcript_path, "a") as f:
         json.dump(record, f, indent=2, default=str)
+
+    # Research manifests pass hidden, output-local telemetry arguments.  The
+    # normal Original Harness CLI does not, so its files and control behavior
+    # remain unchanged.  This sidecar preserves planner exceptions that the
+    # historical transcript schema intentionally did not contain.
+    completion_output = getattr(args, "research_completion_output", None)
+    research_trial_id = getattr(args, "research_trial_id", None)
+    if completion_output is not None:
+        destination = Path(completion_output).expanduser().resolve()
+        if destination.exists():
+            raise FileExistsError(
+                f"research completion sidecar already exists: {destination}"
+            )
+        completion_record = {
+            "schema_version": "rpent.research-completion/v1",
+            "trial_id": str(research_trial_id),
+            "status": (
+                "planner_error"
+                if agent_error
+                else (
+                    "finish_declared"
+                    if finish_result is not None
+                    else "planner_returned_without_finish"
+                )
+            ),
+            "agent_error": str(agent_error) if agent_error else None,
+            "transcript_path": str(transcript_path.resolve()),
+            "transcript_sha256": hashlib.sha256(
+                transcript_path.read_bytes()
+            ).hexdigest(),
+            "elapsed_s": round(elapsed, 1),
+        }
+        temporary = destination.with_name(f".{destination.name}.tmp")
+        if temporary.exists():
+            raise FileExistsError(
+                f"research completion temporary already exists: {temporary}"
+            )
+        try:
+            with temporary.open("x", encoding="utf-8") as stream:
+                json.dump(
+                    completion_record,
+                    stream,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    indent=2,
+                    allow_nan=False,
+                )
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, destination)
+        except Exception:
+            if temporary.exists():
+                temporary.unlink()
+            raise
 
     logger.info("elapsed: %.1fs", elapsed)
     logger.info("usage: in=%s out=%s tool_calls=%s",

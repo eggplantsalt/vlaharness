@@ -16,8 +16,49 @@ from rpent.envs.prompt_bundle import PromptBundle
 from rpent.utils.config import get_repo_root
 
 if TYPE_CHECKING:
+    from robots.libero.handoff_runtime import HandoffRuntimeConfig
     from rpent.utils.daemon import ProcessDaemon
     from rpent.utils.rpc import RpcClient
+
+
+_HANDOFF_CONFIG_ATTR = "_rpent_handoff_runtime_config"
+_HANDOFF_CONFIG_PATH_ATTR = "_rpent_handoff_runtime_config_path"
+_RESEARCH_RESET_IDENTITY_ATTR = "_rpent_research_reset_identity"
+
+
+def _ensure_handoff_config(args: argparse.Namespace) -> HandoffRuntimeConfig | None:
+    """Load/validate opt-in research config before any heavyweight startup."""
+    configured_path = getattr(args, "handoff_config", None)
+    if configured_path is None:
+        setattr(args, _HANDOFF_CONFIG_ATTR, None)
+        setattr(args, _HANDOFF_CONFIG_PATH_ATTR, None)
+        return None
+    resolved = str(Path(configured_path).expanduser().resolve())
+    cached_path = getattr(args, _HANDOFF_CONFIG_PATH_ATTR, None)
+    if cached_path == resolved:
+        return getattr(args, _HANDOFF_CONFIG_ATTR)
+
+    from robots.libero.handoff_runtime import (
+        load_handoff_runtime_config,
+        validate_handoff_runtime_bindings,
+    )
+
+    config = load_handoff_runtime_config(resolved)
+    validate_handoff_runtime_bindings(config)
+    setattr(args, _HANDOFF_CONFIG_ATTR, config)
+    setattr(args, _HANDOFF_CONFIG_PATH_ATTR, resolved)
+    return config
+
+
+def _validate_handoff_output(
+    config: HandoffRuntimeConfig | None,
+    output_dir: Path,
+) -> None:
+    if config is None or not config.enabled:
+        return
+    from robots.libero.handoff_runtime import resolve_handoff_output_dir
+
+    resolve_handoff_output_dir(config, run_output_dir=output_dir)
 
 
 def get_env_spec() -> EnvSpec:
@@ -50,10 +91,23 @@ def get_toolkit(
     """Return the LIBERO toolkit (common tools + LIBERO primitives)."""
     from robots.libero.toolkit import LiberoToolkit
 
+    reset_identity_request = primitives_kwargs.get(
+        _RESEARCH_RESET_IDENTITY_ATTR
+    )
+    if _HANDOFF_CONFIG_ATTR in primitives_kwargs or reset_identity_request is not None:
+        primitive_args = dict(primitives_kwargs)
+        handoff_config = primitive_args.pop(_HANDOFF_CONFIG_ATTR, None)
+        primitive_args.pop(_RESEARCH_RESET_IDENTITY_ATTR, None)
+    else:
+        # Preserve the exact baseline kwargs object when research is absent.
+        primitive_args = primitives_kwargs
+        handoff_config = None
     return LiberoToolkit(
-        primitives_kwargs=primitives_kwargs,
+        primitives_kwargs=primitive_args,
         dashboard_events=dashboard_events,
         video_path=video_path,
+        handoff_config=handoff_config,
+        reset_identity_request=reset_identity_request,
     )
 
 
@@ -88,6 +142,25 @@ def _add_cli_args(parser: argparse.ArgumentParser, use_dashboard: bool) -> None:
                              "If unset, a local SAM3 server is spawned.")
     parser.add_argument("--cuda-device", type=int, default=None,
                         help="GPU device to expose via CUDA_VISIBLE_DEVICES.")
+    parser.add_argument(
+        "--handoff-config",
+        default=None,
+        help=(
+            "Path to a validated JSON config enabling the separate controller-"
+            "handoff research tools. Omit for exact Original Harness behavior."
+        ),
+    )
+    parser.add_argument("--research-trial-id", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--research-reset-identity-output",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--research-completion-output",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
 
 
 def _parse_config(args: argparse.Namespace) -> RunConfig:
@@ -97,10 +170,26 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
     optional so the dashboard could fill them; this is where we enforce
     they're set now that any overrides have been applied.
     """
+    _ensure_handoff_config(args)
     if not args.suite:
         raise ValueError("--suite is required")
     if args.task is None:
         raise ValueError("--task is required")
+    research_trial_id = getattr(args, "research_trial_id", None)
+    reset_identity_output = getattr(
+        args, "research_reset_identity_output", None
+    )
+    completion_output = getattr(args, "research_completion_output", None)
+    if len(
+        {
+            research_trial_id is None,
+            reset_identity_output is None,
+            completion_output is None,
+        }
+    ) != 1:
+        raise ValueError(
+            "research telemetry requires all three hidden research arguments"
+        )
 
     recipe_tag = f"{args.suite.replace('libero_', '')}_t{args.task}_s{args.seed}"
     prompt_vars = {
@@ -115,6 +204,21 @@ def _parse_config(args: argparse.Namespace) -> RunConfig:
         timestamp = datetime.now().strftime("%Y%m%d-%H:%M:%S")
         output_dir = get_repo_root() / "logs" / f"{timestamp}_{args.suite}_t{args.task}_s{args.seed}"
     output_dir = Path(output_dir)
+    if reset_identity_output is not None:
+        resolved_output = Path(reset_identity_output).expanduser().resolve()
+        expected_output = (output_dir.resolve() / "reset_identity.json")
+        if resolved_output != expected_output:
+            raise ValueError(
+                "research reset identity output must be reset_identity.json "
+                "inside this run output directory"
+            )
+        resolved_completion = Path(completion_output).expanduser().resolve()
+        expected_completion = output_dir.resolve() / "completion.json"
+        if resolved_completion != expected_completion:
+            raise ValueError(
+                "research completion output must be completion.json inside "
+                "this run output directory"
+            )
 
     return RunConfig(
         recipe_tag=recipe_tag,
@@ -149,6 +253,9 @@ def init_task_runtime(
     Heavy runtime dependencies stay lazy so importing :mod:`robots.libero`
     for its descriptor or toolkit does not load RPC/model packages.
     """
+    handoff_config = _ensure_handoff_config(args)
+    _validate_handoff_output(handoff_config, output_dir)
+
     from robots.libero.env_client import LiberoEnvClient
     from rpent.utils.config import get_libero_type
     from rpent.utils.daemon import ProcessDaemon, pick_free_port
@@ -215,7 +322,18 @@ def init_task_runtime(
         dashboard_events.emit(RuntimeStatusEvent("env", "failed", error=exc))
         raise
     dashboard_events.emit(RuntimeStatusEvent("env", "ready"))
-    return owned_daemons, {"env": env}
+    runtime_values: dict[str, Any] = {"env": env}
+    if handoff_config is not None and handoff_config.enabled:
+        runtime_values[_HANDOFF_CONFIG_ATTR] = handoff_config
+    if getattr(args, "research_trial_id", None) is not None:
+        runtime_values[_RESEARCH_RESET_IDENTITY_ATTR] = {
+            "path": str(Path(args.research_reset_identity_output).resolve()),
+            "trial_id": str(args.research_trial_id),
+            "suite": str(args.suite),
+            "task": int(args.task),
+            "seed": int(args.seed),
+        }
+    return owned_daemons, runtime_values
 
 
 def init_shared_runtime(
@@ -228,6 +346,9 @@ def init_shared_runtime(
     The returned list contains only locally started services. External
     endpoints are connected to but never become owned.
     """
+    handoff_config = _ensure_handoff_config(args)
+    _validate_handoff_output(handoff_config, output_dir)
+
     from rpent.utils.daemon import ProcessDaemon, pick_free_port
     from rpent.utils.http_rpc import HttpRpcClient
     from rpent.utils.rpc import parse_endpoint, wait_for_ready
@@ -355,6 +476,9 @@ def _init_runtime(
     that a bare ``import robots.libero`` (for ``get_env_spec`` /
     ``get_toolkit``) doesn't drag them in.
     """
+    handoff_config = _ensure_handoff_config(args)
+    _validate_handoff_output(handoff_config, output_dir)
+
     from robots.libero.env_client import LiberoEnvClient
     from rpent.utils.config import get_libero_type
     from rpent.utils.daemon import ProcessDaemon, pick_free_port
@@ -516,6 +640,16 @@ def _init_runtime(
         "model": VLAClient(vla_rpc),
         "sam3_client": Sam3Client(sam3_rpc),
     }
+    if handoff_config is not None and handoff_config.enabled:
+        primitives_kwargs[_HANDOFF_CONFIG_ATTR] = handoff_config
+    if getattr(args, "research_trial_id", None) is not None:
+        primitives_kwargs[_RESEARCH_RESET_IDENTITY_ATTR] = {
+            "path": str(Path(args.research_reset_identity_output).resolve()),
+            "trial_id": str(args.research_trial_id),
+            "suite": str(args.suite),
+            "task": int(args.task),
+            "seed": int(args.seed),
+        }
     return daemons, primitives_kwargs
 
 

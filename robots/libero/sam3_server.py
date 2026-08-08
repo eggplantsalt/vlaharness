@@ -15,9 +15,11 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import importlib.metadata
 import io
 import logging
 import os
+import platform
 import threading
 from contextlib import nullcontext
 from pathlib import Path
@@ -80,11 +82,13 @@ class Sam3Engine:
         *,
         device: str = "cuda",
         torch_module: Any | None = None,
+        checkpoint_path: str | None = None,
     ) -> None:
         self._model = model
         self._processor = processor
         self._device = device
         self._torch = torch_module
+        self._checkpoint_path = checkpoint_path
         self._lock = threading.Lock()
         self._image_digest: str | None = None
         self._image_state: dict[str, Any] | None = None
@@ -126,7 +130,13 @@ class Sam3Engine:
                 f"failed to load SAM 3.0 checkpoint: {checkpoint_path}"
             ) from exc
         processor = Sam3Processor(model, device="cuda", confidence_threshold=0.0)
-        return cls(model, processor, device="cuda", torch_module=torch)
+        return cls(
+            model,
+            processor,
+            device="cuda",
+            torch_module=torch,
+            checkpoint_path=checkpoint_path,
+        )
 
     def segment(
         self,
@@ -290,6 +300,8 @@ class Sam3Facade(RpcFacade):
     def _dispatch(self, method: str, args: tuple, kwargs: dict) -> Any:
         if method == "segment":
             return self.segment(*args, **kwargs)
+        if method in {"sam3.runtime_probe", "runtime_probe"}:
+            return self.runtime_probe()
         raise ValueError(f"unknown RPC method: {method!r}")
 
     def segment(
@@ -316,6 +328,72 @@ class Sam3Facade(RpcFacade):
             min_score=request.min_score,
         )
         return response.model_dump(exclude_none=True)
+
+    def runtime_probe(self) -> dict[str, Any]:
+        """Return SAM3 checkpoint, model, image-contract, and CUDA metadata."""
+        checkpoint = self._engine._checkpoint_path
+        checkpoint_info: dict[str, Any] | None = None
+        if checkpoint is not None:
+            path = Path(checkpoint)
+            checkpoint_info = {
+                "path": str(path),
+                "exists": path.exists(),
+                "is_file": path.is_file(),
+            }
+            if path.exists():
+                stat = path.stat()
+                checkpoint_info.update(
+                    {"size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+                )
+        packages: dict[str, str | None] = {}
+        for name in ("sam3", "torch", "pillow"):
+            try:
+                packages[name] = importlib.metadata.version(name)
+            except importlib.metadata.PackageNotFoundError:
+                packages[name] = None
+        torch_module = self._engine._torch
+        cuda: dict[str, Any]
+        if torch_module is None:
+            cuda = {"available": False, "device": self._engine._device}
+        else:
+            available = bool(torch_module.cuda.is_available())
+            cuda = {
+                "available": available,
+                "device": self._engine._device,
+                "device_count": int(torch_module.cuda.device_count()) if available else 0,
+            }
+            if available:
+                device = int(torch_module.cuda.current_device())
+                cuda.update(
+                    {
+                        "current_device": device,
+                        "device_name": torch_module.cuda.get_device_name(device),
+                        "memory_allocated_bytes": int(
+                            torch_module.cuda.memory_allocated(device)
+                        ),
+                        "memory_reserved_bytes": int(
+                            torch_module.cuda.memory_reserved(device)
+                        ),
+                    }
+                )
+        return {
+            "schema_version": "rpent.runtime-probe/v1",
+            "component": "sam3",
+            "python": platform.python_version(),
+            "packages": packages,
+            "checkpoint": checkpoint_info,
+            "model_class": (
+                f"{type(self._engine._model).__module__}."
+                f"{type(self._engine._model).__qualname__}"
+            ),
+            "cuda": cuda,
+            "image_contract": {
+                "wire_encoding": "base64 encoded image bytes",
+                "in_memory_client_method": "Sam3Client.segment_image",
+                "point_convention": "[row, col]",
+                "exactly_one_prompt": True,
+            },
+        }
 
 
 def _build_argparser() -> argparse.ArgumentParser:

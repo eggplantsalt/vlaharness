@@ -42,6 +42,7 @@ dependencies = [
 
 [project.scripts]
 rpent = "rpent.cli.main:main"
+rpent-handoff = "rpent.research.handoff.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/RLinf/RPent"
@@ -75,6 +76,11 @@ sam3 = [
     "torch",
     "torchvision",
     "pillow>=10",
+]
+handoff = [
+    "scikit-learn>=1.4",
+    "joblib>=1.3",
+    "matplotlib>=3.8",
 ]
 
 [tool.uv]
@@ -121,3 +127,8 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 docstring-code-format = true
 docstring-code-line-length = "dynamic"
+
+[tool.pytest.ini_options]
+markers = [
+    "handoff_server: requires Linux CUDA plus configured LIBERO/RLinf/Pi0.5/SAM3 runtime",
+]

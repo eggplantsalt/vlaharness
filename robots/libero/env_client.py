@@ -46,6 +46,7 @@ class LiberoEnvClient:
             "different args than this client expects — kill the stale "
             "env_server and relaunch."
         )
+        self.server_meta = dict(server_meta)
         self.reset()
 
     def check_done(self, term, trunc) -> None:
@@ -95,6 +96,40 @@ class LiberoEnvClient:
 
     def raw_obs(self) -> dict:
         return self._client.call("env.raw_obs", timeout_s=_TIMEOUT_S["default"])
+
+    def runtime_probe(self) -> dict[str, Any]:
+        """Return non-policy runtime/capability metadata from the env server."""
+        payload = self._client.call(
+            "env.runtime_probe", timeout_s=_TIMEOUT_S["default"]
+        )
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"invalid env runtime probe response: {payload!r}")
+        return payload
+
+    def diagnostic_chunk_step(
+        self,
+        actions,
+    ) -> tuple[Any, Any, Any, Any, Any]:
+        """Destructively probe external within-chunk behavior on a fresh trial.
+
+        This is deliberately separate from ``chunk_step`` so server runbooks
+        cannot mistake the diagnostic for a normal rollout.  It still latches
+        termination/truncation flags exactly like ordinary execution. Returned
+        frame/flag lengths characterize the external RPC contract; without an
+        external executed-step counter they do not prove that physics continued
+        after the first done signal.
+        """
+        assert not (self.episode_terminated or self.episode_truncated), (
+            "env diagnostic_chunk_step called after the episode signaled term/trunc"
+        )
+        ret = self._client.call(
+            "env.diagnostic_chunk_step",
+            args=(actions,),
+            timeout_s=_TIMEOUT_S["env.chunk_step"],
+        )
+        _, _, term, trunc, _ = ret
+        self.check_done(term, trunc)
+        return ret
 
     def render_camera(
         self,

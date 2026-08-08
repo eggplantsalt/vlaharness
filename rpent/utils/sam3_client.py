@@ -45,6 +45,117 @@ class Sam3Client:
 
         Point coordinates use RPent's image convention: ``[row, col]``.
         """
+        # Preserve the baseline API's original validation-before-file-read
+        # behavior (including which error wins for an invalid request/path).
+        prompt, has_text = self._validate_request(
+            text_prompt=text_prompt,
+            point=point,
+            min_score=min_score,
+        )
+        image_bytes = Path(image_path).read_bytes()
+        return self._segment_bytes(
+            image_bytes,
+            prompt=prompt,
+            has_text=has_text,
+            point=point,
+            min_score=min_score,
+        )
+
+    def segment_image(
+        self,
+        image: np.ndarray | bytes | bytearray | memoryview,
+        *,
+        text_prompt: str | None = None,
+        point: list[int] | None = None,
+        min_score: float = 0.2,
+    ) -> Sam3Result:
+        """Segment a current in-memory RGB image without creating an artifact.
+
+        ``segment(path)`` remains the baseline artifact API.  This additional
+        method is used by the opt-in handoff adapter so every local observation
+        can be segmented before the outer primitive writes its one state dump.
+        Numpy input must be an ``[H,W,3]`` RGB image; bytes input must already be
+        an encoded image accepted by the SAM3 server (normally PNG).
+        """
+        prompt, has_text = self._validate_request(
+            text_prompt=text_prompt,
+            point=point,
+            min_score=min_score,
+        )
+
+        if isinstance(image, np.ndarray):
+            array = np.asarray(image)
+            if array.ndim != 3 or array.shape[-1] != 3:
+                raise ValueError(
+                    f"SAM3 image must have shape [H,W,3], got {array.shape}"
+                )
+            if array.dtype != np.uint8:
+                array = array.astype(np.uint8)
+            buffer = io.BytesIO()
+            imageio.imwrite(buffer, np.ascontiguousarray(array), format="png")
+            image_bytes = buffer.getvalue()
+        elif isinstance(image, (bytes, bytearray, memoryview)):
+            image_bytes = bytes(image)
+            if not image_bytes:
+                raise ValueError("SAM3 image bytes are empty")
+        else:
+            raise TypeError(
+                "image must be an RGB numpy array or encoded image bytes"
+            )
+        return self._segment_bytes(
+            image_bytes,
+            prompt=prompt,
+            has_text=has_text,
+            point=point,
+            min_score=min_score,
+        )
+
+    def healthz(self, *, timeout_s: float | None = None) -> dict[str, Any]:
+        return self._client.call("healthz", timeout_s=timeout_s)
+
+    def runtime_probe(self) -> dict[str, Any]:
+        """Return server-side SAM3/checkpoint/device metadata."""
+        payload = self._client.call(
+            "sam3.runtime_probe",
+            timeout_s=self._timeout_s,
+        )
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"invalid SAM3 runtime probe response: {payload!r}")
+        return payload
+
+    def _segment_bytes(
+        self,
+        image_bytes: bytes,
+        *,
+        prompt: str | None,
+        has_text: bool,
+        point: list[int] | None,
+        min_score: float,
+    ) -> Sam3Result:
+        body: dict[str, Any] = {
+            "image_base64": base64.b64encode(image_bytes).decode("ascii"),
+            "min_score": float(min_score),
+        }
+        if has_text:
+            body["text_prompt"] = prompt
+        else:
+            assert point is not None
+            body["point"] = [int(point[0]), int(point[1])]
+
+        payload = self._client.call(
+            "segment",
+            kwargs=body,
+            timeout_s=self._timeout_s,
+        )
+        return self._decode_result(payload)
+
+    @staticmethod
+    def _validate_request(
+        *,
+        text_prompt: str | None,
+        point: list[int] | None,
+        min_score: float,
+    ) -> tuple[str | None, bool]:
         prompt = text_prompt.strip() if isinstance(text_prompt, str) else None
         has_text = bool(prompt)
         has_point = point is not None
@@ -54,23 +165,7 @@ class Sam3Client:
             raise ValueError("point must be [row, col]")
         if not 0.0 <= float(min_score) <= 1.0:
             raise ValueError("min_score must be between 0 and 1")
-
-        image_bytes = Path(image_path).read_bytes()
-        body: dict[str, Any] = {
-            "image_base64": base64.b64encode(image_bytes).decode("ascii"),
-            "min_score": float(min_score),
-        }
-        if has_text:
-            body["text_prompt"] = prompt
-        else:
-            body["point"] = [int(point[0]), int(point[1])]
-
-        payload = self._client.call(
-            "segment",
-            kwargs=body,
-            timeout_s=self._timeout_s,
-        )
-        return self._decode_result(payload)
+        return prompt, has_text
 
     @staticmethod
     def _decode_result(payload: Any) -> Sam3Result:

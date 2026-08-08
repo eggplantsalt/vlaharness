@@ -1,0 +1,4 @@
+{
+  "preset": "deployment_full",
+  "skill_vocabulary": ["pick", "contact"]
+}

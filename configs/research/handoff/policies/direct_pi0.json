@@ -1,0 +1,37 @@
+{
+  "schema_version": "rpent.libero-handoff-runtime/v1",
+  "enabled": true,
+  "core": {
+    "governor": {
+      "max_analytic_steps": 0,
+      "max_staging_distance_m": 0.0,
+      "max_local_time_s": 30.0,
+      "max_step_distance_m": 0.025,
+      "max_target_age_s": 2.0,
+      "fallback_mode": "abort",
+      "budget_fallback_mode": "abort",
+      "propagate_cancellation": true
+    },
+    "candidate_generator": {
+      "standoff_distances_m": [0.08],
+      "max_candidates": 1
+    },
+    "feature_spec": {
+      "preset": "deployment_full",
+      "skill_vocabulary": ["pick", "contact"]
+    },
+    "policy": {"name": "direct_frozen_pi0"}
+  },
+  "target_provider": {
+    "kind": "injected",
+    "availability": "deployment_perception",
+    "provider": "disabled_for_direct_baseline/v1"
+  },
+  "tool_defaults": {},
+  "instrumentation": true,
+  "output_subdir": "handoff",
+  "oracle_ablation": false,
+  "controller_method": "direct_frozen_pi0",
+  "controller_implementation_version": "rpent-libero-handoff/v1",
+  "metadata": {"condition": "direct_pi0", "target_geometry_consumed": false}
+}
